@@ -5,7 +5,8 @@ Multi-Symbol Backtest: UT Bot + HMA/EMA Strategy with Staged Exits
 
 Strategy:
   - Indicators: UT Bot (ATR 10, K=2.5), HMA(100), EMA(200) via pandas-ta
-  - Entry:  UT Bot Buy env  AND  Close > HMA(100)  AND  Close > EMA(200)
+  - Entry:  UT Bot Buy SIGNAL  AND  Close > HMA(100)  AND  Close > EMA(200)
+            → execute at NEXT day's open price
             Position size = 5% of initial capital (max 20 concurrent positions)
   - Exit (staged profit-taking):
             +5%  → sell 30% of initial shares
@@ -49,6 +50,17 @@ TP1_PCT = 0.05;  TP1_EXIT = 0.30   # +5 % → sell 30 %
 TP2_PCT = 0.10;  TP2_EXIT = 0.50   # +10 % → sell 50 %
 TP3_PCT = 0.20                      # +20 % → sell all remaining
 
+REPORTS_DIR = Path("reports")       # per-symbol reports
+
+# ETFs to exclude (only keep individual stocks for trading)
+ETF_SYMBOLS = {
+    "DBA", "DIA", "EEM", "EWY", "FNDA", "FNDC", "FNDX",
+    "GLD", "HYG", "IBIT", "IGV", "IWM", "KWEB",
+    "PRF", "PRFZ", "QQQ", "SCHG", "SCHI", "SLV",
+    "SMH", "SOXL", "SOXX", "SPY", "SQQQ", "TLT",
+    "TQQQ", "TSLL",
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UT Bot Indicator
@@ -63,6 +75,7 @@ def calc_ut_bot(close: pd.Series, high: pd.Series, low: pd.Series,
     trailing_stop : pd.Series
     buy_env       : pd.Series[bool]   close > trailing stop
     sell_env      : pd.Series[bool]   close < trailing stop
+    buy_signal    : pd.Series[bool]   cross-over: close crosses above trailing stop
     """
     atr = ta.atr(high, low, close, length=atr_period)
     n_loss = key_value * atr
@@ -91,20 +104,26 @@ def calc_ut_bot(close: pd.Series, high: pd.Series, low: pd.Series,
     trailing_stop = pd.Series(ts, index=close.index)
     buy_env = close > trailing_stop
     sell_env = close < trailing_stop
-    return trailing_stop, buy_env, sell_env
+    # Buy signal: close crosses above the trailing stop (crossover)
+    buy_signal = buy_env & (~buy_env.shift(1, fill_value=False))
+    return trailing_stop, buy_env, sell_env, buy_signal
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Data Loading & Indicator Computation
 # ═══════════════════════════════════════════════════════════════════════════════
-def load_all_data() -> dict[str, pd.DataFrame]:
+def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
     """Load every *_25Y_daily.csv from DATA_DIR and compute indicators."""
     all_data: dict[str, pd.DataFrame] = {}
     csv_files = sorted(DATA_DIR.glob("*_25Y_daily.csv"))
     print(f"[data] Found {len(csv_files)} CSV files in {DATA_DIR}/")
+    skipped_etfs: list[str] = []
 
     for f in csv_files:
         symbol = f.stem.replace("_25Y_daily", "")
+        if exclude_etfs and symbol in ETF_SYMBOLS:
+            skipped_etfs.append(symbol)
+            continue
         df = pd.read_csv(f, parse_dates=["date"], index_col="date")
         df = df.sort_index()
         df = df[~df.index.duplicated(keep="last")]
@@ -115,20 +134,29 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         # Indicators
         df["hma"] = ta.hma(df["close"], length=HMA_LENGTH)
         df["ema200"] = ta.ema(df["close"], length=EMA_LENGTH)
-        ts, buy_env, sell_env = calc_ut_bot(df["close"], df["high"], df["low"])
+        ts, buy_env, sell_env, buy_signal = calc_ut_bot(
+            df["close"], df["high"], df["low"])
         df["ut_stop"] = ts
         df["ut_buy"] = buy_env
         df["ut_sell"] = sell_env
+        df["ut_buy_signal"] = buy_signal
 
-        df = df.dropna(subset=["hma", "ema200"])
+        # ADX(14)
+        adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
+        df["adx"] = adx_df[f"ADX_14"]
+
+        df = df.dropna(subset=["hma", "ema200", "adx"])
         if len(df) < 50:
             continue
 
         # Pre-computed signals
+        # Entry: UT Bot buy environment + close > HMA + close > EMA + ADX > 20
+        # (actual buy happens at NEXT day's open)
         df["entry_ok"] = (
             df["ut_buy"]
             & (df["close"] > df["hma"])
             & (df["close"] > df["ema200"])
+            & (df["adx"] > 20)
         )
         df["stop_hit"] = (
             (df["close"] < df["hma"])
@@ -137,7 +165,9 @@ def load_all_data() -> dict[str, pd.DataFrame]:
         )
         all_data[symbol] = df
 
-    print(f"[data] {len(all_data)} symbols ready after indicator warm-up")
+    if skipped_etfs:
+        print(f"[data] Excluded {len(skipped_etfs)} ETFs: {', '.join(skipped_etfs)}")
+    print(f"[data] {len(all_data)} stocks ready after indicator warm-up")
     return all_data
 
 
@@ -168,6 +198,9 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
     """
     Run the event-driven portfolio simulation.
 
+    Entry signals fire at day-T close; execution happens at day-(T+1) open.
+    Exits (stop-loss & profit-taking) are evaluated and executed at close.
+
     Returns
     -------
     equity_df : DataFrame  (date index → equity, cash, invested, n_positions)
@@ -184,10 +217,43 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
     equity_records: list[dict] = []
     trade_log: list[dict] = []
 
+    # Pending entries: signals that fired yesterday, to be filled at today's open
+    pending_entries: set[str] = set()
+
     for date in all_dates:
         closed_today: set[str] = set()
 
-        # ── Phase 1: Exits ────────────────────────────────────────────────
+        # ── Phase 0: Execute pending entries at today's OPEN ──────────────
+        for sym in sorted(pending_entries):
+            if sym in positions:
+                continue
+            df = all_data[sym]
+            if date not in df.index:
+                continue
+            open_price = df.loc[date, "open"]
+            if open_price <= 0 or np.isnan(open_price):
+                continue
+
+            budget = min(alloc_amount, cash)
+            if budget < 100:
+                continue
+            shares = int(budget / open_price)
+            if shares <= 0:
+                continue
+
+            cost = shares * open_price
+            cash -= cost
+            positions[sym] = Position(sym, open_price, date, shares)
+            trade_log.append(dict(
+                symbol=sym, date=date, side="BUY",
+                shares=shares, price=open_price,
+                reason="ENTRY", pnl_pct=0.0,
+                entry_price=open_price, entry_date=date,
+            ))
+        # Clear all pending (one-shot signals, execute or discard)
+        pending_entries.clear()
+
+        # ── Phase 1: Exits at today's CLOSE ───────────────────────────────
         to_remove: list[str] = []
         for sym, pos in positions.items():
             df = all_data[sym]
@@ -267,33 +333,15 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
         for sym in to_remove:
             positions.pop(sym, None)
 
-        # ── Phase 2: Entries ──────────────────────────────────────────────
+        # ── Phase 2: Generate entry SIGNALS at close (fill tomorrow) ──────
         for sym in sorted(all_data.keys()):
             if sym in positions or sym in closed_today:
                 continue
             df = all_data[sym]
             if date not in df.index:
                 continue
-            row = df.loc[date]
-            if not row["entry_ok"]:
-                continue
-
-            budget = min(alloc_amount, cash)
-            if budget < 100:
-                continue
-            shares = int(budget / row["close"])
-            if shares <= 0:
-                continue
-
-            cost = shares * row["close"]
-            cash -= cost
-            positions[sym] = Position(sym, row["close"], date, shares)
-            trade_log.append(dict(
-                symbol=sym, date=date, side="BUY",
-                shares=shares, price=row["close"],
-                reason="ENTRY", pnl_pct=0.0,
-                entry_price=row["close"], entry_date=date,
-            ))
+            if df.loc[date, "entry_ok"]:
+                pending_entries.add(sym)
 
         # ── Phase 3: Record equity ───────────────────────────────────────
         pos_value = sum(
@@ -370,9 +418,53 @@ def build_round_trips(trade_df: pd.DataFrame) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SPY Buy-and-Hold Benchmark
+# ═══════════════════════════════════════════════════════════════════════════════
+def load_spy_benchmark(backtest_start, backtest_end) -> pd.DataFrame | None:
+    """Load SPY data and compute buy-and-hold equity over the backtest period."""
+    spy_path = DATA_DIR / "SPY_25Y_daily.csv"
+    if not spy_path.exists():
+        print("[bench] SPY_25Y_daily.csv not found — skipping benchmark")
+        return None
+
+    df = pd.read_csv(spy_path, parse_dates=["date"], index_col="date").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    df = df[(df.index >= backtest_start) & (df.index <= backtest_end)]
+    if df.empty:
+        return None
+
+    initial_price = df["close"].iloc[0]
+    shares = INITIAL_CAPITAL / initial_price
+    df["spy_equity"] = shares * df["close"]
+    print(f"[bench] SPY B&H loaded: {df.index[0].date()} → {df.index[-1].date()}, "
+          f"final ${df['spy_equity'].iloc[-1]:,.0f}")
+    return df
+
+
+def _spy_stats(spy_df: pd.DataFrame) -> dict:
+    """Compute basic stats for the SPY buy-and-hold benchmark."""
+    eq = spy_df["spy_equity"]
+    rets = eq.pct_change().dropna()
+    total_days = (eq.index[-1] - eq.index[0]).days
+    total_years = max(total_days / 365.25, 1e-6)
+    total_ret = eq.iloc[-1] / eq.iloc[0] - 1
+    cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1 / total_years) - 1
+    peak = eq.cummax()
+    max_dd = ((eq - peak) / peak).min()
+    ann_vol = rets.std() * np.sqrt(252)
+    sharpe = rets.mean() / rets.std() * np.sqrt(252) if rets.std() > 0 else 0
+    return dict(
+        spy_total_return=total_ret, spy_cagr=cagr,
+        spy_max_dd=max_dd, spy_ann_vol=ann_vol, spy_sharpe=sharpe,
+        spy_final_equity=eq.iloc[-1],
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Performance Analytics (vectorbt + manual)
 # ═══════════════════════════════════════════════════════════════════════════════
-def compute_overall_stats(equity_df: pd.DataFrame, round_trips: list[dict]) -> dict:
+def compute_overall_stats(equity_df: pd.DataFrame, round_trips: list[dict],
+                          spy_df: pd.DataFrame | None = None) -> dict:
     """Compute portfolio-level performance metrics."""
     equity = equity_df["equity"]
     rets = equity.pct_change().dropna()
@@ -419,7 +511,7 @@ def compute_overall_stats(equity_df: pd.DataFrame, round_trips: list[dict]) -> d
         win_rate = avg_win = avg_loss = profit_factor = avg_hold = 0
         best_trade = worst_trade = None
 
-    return dict(
+    result = dict(
         start_date=equity.index[0].strftime("%Y-%m-%d"),
         end_date=equity.index[-1].strftime("%Y-%m-%d"),
         total_years=total_years,
@@ -445,6 +537,18 @@ def compute_overall_stats(equity_df: pd.DataFrame, round_trips: list[dict]) -> d
         worst_trade=worst_trade,
     )
 
+    # SPY benchmark comparison
+    if spy_df is not None:
+        spy = _spy_stats(spy_df)
+        result.update(spy)
+        result["alpha"] = cagr - spy["spy_cagr"]
+    else:
+        result.update(dict(
+            spy_total_return=None, spy_cagr=None, spy_max_dd=None,
+            spy_ann_vol=None, spy_sharpe=None, spy_final_equity=None, alpha=None,
+        ))
+    return result
+
 
 def compute_per_symbol_stats(round_trips: list[dict]) -> pd.DataFrame:
     if not round_trips:
@@ -465,6 +569,129 @@ def compute_per_symbol_stats(round_trips: list[dict]) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Per-Symbol Full-Position Backtest
+# ═══════════════════════════════════════════════════════════════════════════════
+def run_single_backtest(df: pd.DataFrame, symbol: str,
+                        initial_capital: float = INITIAL_CAPITAL):
+    """
+    Backtest a single symbol with 100 % allocation (full position).
+
+    Returns  (equity_df, trade_df, round_trips)
+    """
+    dates = df.index
+    cash = initial_capital
+    pos: Position | None = None
+    pending = False        # signal fired at close, buy at next open
+
+    equity_records: list[dict] = []
+    trade_log: list[dict] = []
+
+    for i, date in enumerate(dates):
+        # ── Phase 0: Execute pending entry at today's open ────────────────
+        if pending and pos is None:
+            op = df.loc[date, "open"]
+            if op > 0 and not np.isnan(op):
+                shares = int(cash / op)
+                if shares > 0:
+                    cost = shares * op
+                    cash -= cost
+                    pos = Position(symbol, op, date, shares)
+                    trade_log.append(dict(
+                        symbol=symbol, date=date, side="BUY",
+                        shares=shares, price=op,
+                        reason="ENTRY", pnl_pct=0.0,
+                        entry_price=op, entry_date=date,
+                    ))
+            pending = False
+
+        # ── Phase 1: Exits at close ───────────────────────────────────────
+        close_price = df.loc[date, "close"]
+        if pos is not None and pos.remaining_shares > 0:
+            pnl_pct = (close_price - pos.entry_price) / pos.entry_price
+            closed = False
+
+            # Stop-loss
+            if df.loc[date, "stop_hit"]:
+                sell_n = pos.remaining_shares
+                cash += sell_n * close_price
+                trade_log.append(dict(
+                    symbol=symbol, date=date, side="SELL",
+                    shares=sell_n, price=close_price,
+                    reason="STOP", pnl_pct=pnl_pct,
+                    entry_price=pos.entry_price, entry_date=pos.entry_date,
+                ))
+                pos.remaining_shares = 0
+                closed = True
+
+            # Profit-taking (highest first)
+            elif pnl_pct >= TP3_PCT:
+                sell_n = pos.remaining_shares
+                cash += sell_n * close_price
+                trade_log.append(dict(
+                    symbol=symbol, date=date, side="SELL",
+                    shares=sell_n, price=close_price,
+                    reason="TP3_20%", pnl_pct=pnl_pct,
+                    entry_price=pos.entry_price, entry_date=pos.entry_date,
+                ))
+                pos.remaining_shares = 0
+                closed = True
+
+            elif pnl_pct >= TP2_PCT and not pos.took_tp2:
+                sell_n = max(1, int(pos.initial_shares * TP2_EXIT))
+                sell_n = min(sell_n, pos.remaining_shares)
+                if sell_n > 0:
+                    cash += sell_n * close_price
+                    pos.remaining_shares -= sell_n
+                    trade_log.append(dict(
+                        symbol=symbol, date=date, side="SELL",
+                        shares=sell_n, price=close_price,
+                        reason="TP2_10%", pnl_pct=pnl_pct,
+                        entry_price=pos.entry_price, entry_date=pos.entry_date,
+                    ))
+                pos.took_tp2 = True
+                if not pos.took_tp1:
+                    pos.took_tp1 = True
+                if pos.remaining_shares <= 0:
+                    closed = True
+
+            elif pnl_pct >= TP1_PCT and not pos.took_tp1:
+                sell_n = max(1, int(pos.initial_shares * TP1_EXIT))
+                sell_n = min(sell_n, pos.remaining_shares)
+                if sell_n > 0:
+                    cash += sell_n * close_price
+                    pos.remaining_shares -= sell_n
+                    trade_log.append(dict(
+                        symbol=symbol, date=date, side="SELL",
+                        shares=sell_n, price=close_price,
+                        reason="TP1_5%", pnl_pct=pnl_pct,
+                        entry_price=pos.entry_price, entry_date=pos.entry_date,
+                    ))
+                pos.took_tp1 = True
+                if pos.remaining_shares <= 0:
+                    closed = True
+
+            if closed:
+                pos = None
+
+        # ── Phase 2: Generate entry signal at close ───────────────────────
+        pending = False
+        if pos is None and df.loc[date, "entry_ok"]:
+            pending = True
+
+        # ── Phase 3: Record equity ────────────────────────────────────────
+        held_value = (pos.remaining_shares * close_price) if pos else 0.0
+        equity_records.append(dict(date=date, equity=cash + held_value,
+                                   cash=cash, invested=held_value))
+
+    equity_df = pd.DataFrame(equity_records).set_index("date")
+    trade_df = pd.DataFrame(trade_log) if trade_log else pd.DataFrame(
+        columns=["symbol", "date", "side", "shares", "price",
+                 "reason", "pnl_pct", "entry_price", "entry_date"])
+    rt = build_round_trips(trade_df)
+    return equity_df, trade_df, rt
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Plotly Chart Generators
 # ═══════════════════════════════════════════════════════════════════════════════
 _PLOTLY_CFG = dict(full_html=False, include_plotlyjs=False)
@@ -472,7 +699,7 @@ _COLORS = dict(up="#26a69a", down="#ef5350", blue="#2196f3",
                gray="#9e9e9e", orange="#ff9800")
 
 
-def _chart_equity(equity_df: pd.DataFrame) -> str:
+def _chart_equity(equity_df: pd.DataFrame, spy_df: pd.DataFrame | None = None) -> str:
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3],
         vertical_spacing=0.04,
@@ -480,9 +707,14 @@ def _chart_equity(equity_df: pd.DataFrame) -> str:
     )
     fig.add_trace(go.Scatter(
         x=equity_df.index, y=equity_df["equity"],
-        name="Equity", line=dict(color=_COLORS["blue"], width=1.5),
+        name="Strategy", line=dict(color=_COLORS["blue"], width=1.5),
         fill="tozeroy", fillcolor="rgba(33,150,243,0.08)",
     ), row=1, col=1)
+    if spy_df is not None:
+        fig.add_trace(go.Scatter(
+            x=spy_df.index, y=spy_df["spy_equity"],
+            name="SPY B&H", line=dict(color=_COLORS["orange"], width=1.5, dash="dash"),
+        ), row=1, col=1)
     fig.add_trace(go.Scatter(
         x=equity_df.index, y=equity_df["cash"],
         name="Cash", line=dict(color=_COLORS["gray"], width=1, dash="dot"),
@@ -606,23 +838,42 @@ def _chart_trade_distribution(round_trips: list[dict]) -> str:
     return pio.to_html(fig, **_PLOTLY_CFG)
 
 
-def _chart_yearly_returns(equity_df: pd.DataFrame) -> str:
+def _chart_yearly_returns(equity_df: pd.DataFrame,
+                          spy_df: pd.DataFrame | None = None) -> str:
     equity = equity_df["equity"]
     yearly = equity.resample("YE").last().pct_change().dropna()
     if yearly.empty:
         return ""
     years = yearly.index.year.astype(str)
+
+    fig = go.Figure()
+    # Strategy bars
     colors = [_COLORS["up"] if v > 0 else _COLORS["down"] for v in yearly.values]
-    fig = go.Figure(go.Bar(
-        x=years, y=yearly.values * 100,
+    fig.add_trace(go.Bar(
+        name="Strategy", x=years, y=yearly.values * 100,
         marker_color=colors,
         text=[f"{v:.1f}%" for v in yearly.values * 100],
         textposition="outside",
     ))
+    # SPY bars (side-by-side)
+    if spy_df is not None:
+        spy_yearly = spy_df["spy_equity"].resample("YE").last().pct_change().dropna()
+        spy_years = spy_yearly.index.year.astype(str)
+        spy_colors = ["rgba(33,150,243,0.6)" if v > 0 else "rgba(33,150,243,0.35)"
+                      for v in spy_yearly.values]
+        fig.add_trace(go.Bar(
+            name="SPY B&H", x=spy_years, y=spy_yearly.values * 100,
+            marker_color=spy_colors,
+            text=[f"{v:.1f}%" for v in spy_yearly.values * 100],
+            textposition="outside",
+        ))
+        fig.update_layout(barmode="group")
+
     fig.update_layout(
-        title="Annual Returns",
-        height=350, margin=dict(l=50, r=30, t=40, b=30),
+        title="Annual Returns — Strategy vs SPY Buy & Hold",
+        height=400, margin=dict(l=50, r=30, t=40, b=30),
         yaxis_title="Return %",
+        legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"),
     )
     return pio.to_html(fig, **_PLOTLY_CFG)
 
@@ -639,6 +890,277 @@ def _chart_exit_reasons(round_trips: list[dict]) -> str:
     fig.update_layout(title="Exit Reason Breakdown", height=350,
                       margin=dict(l=30, r=30, t=40, b=30))
     return pio.to_html(fig, **_PLOTLY_CFG)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Per-Symbol OHLC Chart (American Bar Style)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _chart_single_symbol(df: pd.DataFrame, symbol: str,
+                         trade_df: pd.DataFrame) -> str:
+    """
+    Full OHLC chart with UT Bot trailing stop, HMA, EMA, and entry/exit markers.
+    Uses go.Ohlc (American bar style) instead of go.Candlestick.
+    """
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.80, 0.20],
+        vertical_spacing=0.03,
+        subplot_titles=(f"{symbol} — OHLC with Indicators", "Volume"),
+    )
+
+    # ── Row 1: OHLC bars (American style) ─────────────────────────────────
+    fig.add_trace(go.Ohlc(
+        x=df.index, open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"],
+        name="OHLC",
+        increasing_line_color="#26a69a",
+        decreasing_line_color="#ef5350",
+    ), row=1, col=1)
+
+    # UT Bot trailing stop
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["ut_stop"], name="UT Bot Stop",
+        line=dict(color="#ff9800", width=1, dash="dot"), opacity=0.85,
+    ), row=1, col=1)
+
+    # HMA 100
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["hma"], name="HMA 100",
+        line=dict(color="#2196f3", width=1.3),
+    ), row=1, col=1)
+
+    # EMA 200
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["ema200"], name="EMA 200",
+        line=dict(color="#9c27b0", width=1.3),
+    ), row=1, col=1)
+
+    # Entry / Exit markers
+    if not trade_df.empty:
+        buys = trade_df[trade_df["side"] == "BUY"]
+        sells = trade_df[trade_df["side"] == "SELL"]
+        if not buys.empty:
+            fig.add_trace(go.Scatter(
+                x=buys["date"], y=buys["price"], mode="markers",
+                name="Buy",
+                marker=dict(symbol="triangle-up", size=10,
+                            color="#26a69a", line=dict(width=1, color="white")),
+            ), row=1, col=1)
+        if not sells.empty:
+            # color by reason
+            sell_colors = []
+            for r in sells["reason"]:
+                if "STOP" in r:
+                    sell_colors.append("#ef5350")
+                elif "TP3" in r:
+                    sell_colors.append("#4caf50")
+                elif "TP2" in r:
+                    sell_colors.append("#8bc34a")
+                else:
+                    sell_colors.append("#cddc39")
+            fig.add_trace(go.Scatter(
+                x=sells["date"], y=sells["price"], mode="markers",
+                name="Sell",
+                marker=dict(symbol="triangle-down", size=9,
+                            color=sell_colors,
+                            line=dict(width=1, color="white")),
+                text=sells["reason"], hovertemplate="%{x}<br>$%{y:.2f}<br>%{text}",
+            ), row=1, col=1)
+
+    # ── Row 2: Volume ─────────────────────────────────────────────────────
+    vol_colors = np.where(df["close"] >= df["open"], "#26a69a", "#ef5350")
+    fig.add_trace(go.Bar(
+        x=df.index, y=df["volume"], name="Volume",
+        marker_color=vol_colors, opacity=0.5, showlegend=False,
+    ), row=2, col=1)
+
+    # ── Layout ────────────────────────────────────────────────────────────
+    fig.update_layout(
+        height=700,
+        margin=dict(l=50, r=30, t=40, b=30),
+        legend=dict(orientation="h", y=1.015, x=0.5, xanchor="center"),
+        hovermode="x unified",
+        xaxis_rangeslider_visible=False,
+        xaxis2_rangeslider_visible=True,
+        xaxis2_rangeslider_thickness=0.05,
+    )
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Vol", row=2, col=1)
+    return pio.to_html(fig, **_PLOTLY_CFG)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Per-Symbol HTML Report
+# ═══════════════════════════════════════════════════════════════════════════════
+_SINGLE_TPL = Template(r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ symbol }} — Backtest Report</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root { --bg:#f8f9fa;--card:#fff;--border:#e0e0e0;--text:#212121;
+          --muted:#757575;--up:#26a69a;--down:#ef5350;--blue:#2196f3;--r:8px; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+       background:var(--bg);color:var(--text);max-width:1440px;margin:0 auto;
+       padding:24px;line-height:1.5}
+  h1{font-size:1.8rem;margin-bottom:4px}
+  h2{font-size:1.3rem;margin:28px 0 14px;padding-bottom:6px;
+     border-bottom:2px solid var(--blue)}
+  .sub{color:var(--muted);margin-bottom:20px}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+           gap:10px;margin-bottom:20px}
+  .card{background:var(--card);border:1px solid var(--border);
+        border-radius:var(--r);padding:14px}
+  .card .label{font-size:.75rem;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+  .card .value{font-size:1.4rem;font-weight:700;margin-top:3px}
+  .card .value.pos{color:var(--up)} .card .value.neg{color:var(--down)}
+  .chart-box{background:var(--card);border:1px solid var(--border);
+             border-radius:var(--r);padding:10px;margin-bottom:18px;overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:.82rem}
+  th,td{padding:6px 10px;text-align:right;border-bottom:1px solid var(--border)}
+  th{background:#f1f3f5;font-weight:600;position:sticky;top:0}
+  td:first-child,th:first-child{text-align:left}
+  tr:hover td{background:#f5f5f5}
+  .tbl-wrap{max-height:500px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--r)}
+  a.back{display:inline-block;margin-bottom:16px;color:var(--blue);text-decoration:none;font-weight:600}
+  a.back:hover{text-decoration:underline}
+  footer{margin-top:32px;padding-top:12px;border-top:1px solid var(--border);
+         color:var(--muted);font-size:.78rem;text-align:center}
+</style>
+</head>
+<body>
+<a class="back" href="../backtest_report.html">&larr; Back to Portfolio Report</a>
+<h1>{{ symbol }}</h1>
+<p class="sub">{{ start }} &rarr; {{ end }} ({{ n_bars }} bars, {{ "%.1f"|format(years) }} years)
+ &mdash; Full position backtest &mdash; Initial ${{ "{:,.0f}".format(capital) }}</p>
+
+<h2>Performance</h2>
+<div class="metrics">
+  <div class="card"><div class="label">Total Return</div>
+    <div class="value {{ 'pos' if total_ret>=0 else 'neg' }}">{{ "%.2f"|format(total_ret*100) }}%</div></div>
+  <div class="card"><div class="label">CAGR</div>
+    <div class="value {{ 'pos' if cagr>=0 else 'neg' }}">{{ "%.2f"|format(cagr*100) }}%</div></div>
+  <div class="card"><div class="label">Max Drawdown</div>
+    <div class="value neg">{{ "%.2f"|format(max_dd*100) }}%</div></div>
+  <div class="card"><div class="label">Sharpe</div>
+    <div class="value">{{ "%.2f"|format(sharpe) }}</div></div>
+  <div class="card"><div class="label">Sortino</div>
+    <div class="value">{{ "%.2f"|format(sortino) }}</div></div>
+  <div class="card"><div class="label">Final Equity</div>
+    <div class="value">${{ "{:,.0f}".format(final_eq) }}</div></div>
+  <div class="card"><div class="label">Trades</div>
+    <div class="value">{{ n_trades }}</div></div>
+  <div class="card"><div class="label">Win Rate</div>
+    <div class="value">{{ "%.0f"|format(win_rate*100) }}%</div></div>
+  <div class="card"><div class="label">Profit Factor</div>
+    <div class="value">{{ "%.2f"|format(pf) if pf < 1e6 else "∞" }}</div></div>
+  <div class="card"><div class="label">Avg Hold Days</div>
+    <div class="value">{{ "%.1f"|format(avg_hold) }}</div></div>
+</div>
+
+<h2>OHLC Chart with Indicators &amp; Signals</h2>
+<div class="chart-box">{{ ohlc_chart }}</div>
+
+<h2>Equity Curve &amp; Drawdown</h2>
+<div class="chart-box">{{ eq_dd_chart }}</div>
+
+<h2>Trade Log ({{ n_trades }} round-trips)</h2>
+<div class="tbl-wrap">
+<table>
+<thead><tr>
+  <th>Entry</th><th>Exit</th><th>Hold</th><th>Entry $</th>
+  <th>Exit Reason</th><th>P&amp;L %</th><th>P&amp;L $</th>
+</tr></thead>
+<tbody>
+{% for t in trades %}
+<tr>
+  <td>{{ t.entry_date.strftime('%Y-%m-%d') }}</td>
+  <td>{{ t.exit_date.strftime('%Y-%m-%d') }}</td>
+  <td>{{ t.hold_days }}d</td>
+  <td>${{ "%.2f"|format(t.entry_price) }}</td>
+  <td>{{ t.exit_reason }}</td>
+  <td style="color:{{ '#26a69a' if t.pnl_pct>=0 else '#ef5350' }}">{{ "%.2f"|format(t.pnl_pct*100) }}%</td>
+  <td style="color:{{ '#26a69a' if t.pnl>=0 else '#ef5350' }}">${{ "{:,.0f}".format(t.pnl) }}</td>
+</tr>
+{% endfor %}
+</tbody></table></div>
+
+<footer>Generated by backtest.py &mdash; {{ symbol }} full-position backtest</footer>
+</body></html>
+""")
+
+
+def _chart_eq_dd_single(equity_df: pd.DataFrame) -> str:
+    """Small equity + drawdown combo chart for per-symbol report."""
+    eq = equity_df["equity"]
+    dd = (eq - eq.cummax()) / eq.cummax() * 100
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.6, 0.4], vertical_spacing=0.04,
+                        subplot_titles=("Equity", "Drawdown %"))
+    fig.add_trace(go.Scatter(
+        x=eq.index, y=eq, name="Equity",
+        line=dict(color="#2196f3", width=1.3),
+        fill="tozeroy", fillcolor="rgba(33,150,243,0.08)",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=dd.index, y=dd, name="Drawdown",
+        fill="tozeroy", fillcolor="rgba(239,83,80,0.12)",
+        line=dict(color="#ef5350", width=1),
+    ), row=2, col=1)
+    fig.update_layout(height=400, margin=dict(l=50, r=30, t=35, b=30),
+                      hovermode="x unified", showlegend=False)
+    return pio.to_html(fig, **_PLOTLY_CFG)
+
+
+def generate_single_report(symbol: str, df: pd.DataFrame,
+                           equity_df: pd.DataFrame, trade_df: pd.DataFrame,
+                           round_trips: list[dict]):
+    """Write an HTML report for one symbol into REPORTS_DIR/."""
+    eq = equity_df["equity"]
+    rets = eq.pct_change().dropna()
+    total_days = (eq.index[-1] - eq.index[0]).days
+    years = max(total_days / 365.25, 1e-6)
+    total_ret = eq.iloc[-1] / eq.iloc[0] - 1
+    cagr_val = (eq.iloc[-1] / eq.iloc[0]) ** (1 / years) - 1
+    peak = eq.cummax()
+    max_dd = ((eq - peak) / peak).min()
+    sharpe = (rets.mean() / rets.std() * np.sqrt(252)) if rets.std() > 0 else 0
+    down = rets[rets < 0]
+    sortino = (rets.mean() / down.std() * np.sqrt(252)
+               if len(down) > 0 and down.std() > 0 else 0)
+
+    n_rt = len(round_trips)
+    if n_rt > 0:
+        wins = [t for t in round_trips if t["pnl"] > 0]
+        losses = [t for t in round_trips if t["pnl"] <= 0]
+        win_rate = len(wins) / n_rt
+        gp = sum(t["pnl"] for t in wins)
+        gl = abs(sum(t["pnl"] for t in losses))
+        pf_val = gp / gl if gl > 0 else float("inf")
+        avg_hold = np.mean([t["hold_days"] for t in round_trips])
+    else:
+        win_rate = pf_val = avg_hold = 0
+
+    ohlc_chart = _chart_single_symbol(df, symbol, trade_df)
+    eq_dd_chart = _chart_eq_dd_single(equity_df)
+
+    html = _SINGLE_TPL.render(
+        symbol=symbol,
+        start=df.index[0].strftime("%Y-%m-%d"),
+        end=df.index[-1].strftime("%Y-%m-%d"),
+        n_bars=len(df), years=years, capital=INITIAL_CAPITAL,
+        total_ret=total_ret, cagr=cagr_val, max_dd=max_dd,
+        sharpe=sharpe, sortino=sortino, final_eq=eq.iloc[-1],
+        n_trades=n_rt, win_rate=win_rate, pf=pf_val, avg_hold=avg_hold,
+        ohlc_chart=ohlc_chart, eq_dd_chart=eq_dd_chart,
+        trades=round_trips,
+    )
+    out = REPORTS_DIR / f"{symbol}_report.html"
+    out.write_text(html, encoding="utf-8")
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -747,7 +1269,7 @@ HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 <h3>Strategy Rules</h3>
 <ul>
   <li><b>Indicators:</b> UT Bot (ATR {{ atr_period }}, K={{ ut_k }}), HMA({{ hma_len }}), EMA({{ ema_len }})</li>
-  <li><b>Entry:</b> UT Bot in <em>Buy</em> environment AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) &mdash; allocate {{ pos_pct }}% of initial capital per position (max 20 concurrent)</li>
+  <li><b>Entry:</b> UT Bot <em>Buy signal</em> (crossover) AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) &rarr; buy at <b>next day's open</b> &mdash; allocate {{ pos_pct }}% of initial capital per position (max 20 concurrent)</li>
   <li><b>Exit (staged):</b> +5% &rarr; sell 30%, +10% &rarr; sell 50%, +20% &rarr; sell all remaining</li>
   <li><b>Stop-loss:</b> Close &lt; HMA({{ hma_len }}) OR Close &lt; EMA({{ ema_len }}) OR UT Bot enters <em>Sell</em> environment</li>
 </ul>
@@ -798,6 +1320,27 @@ HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 </div>
 {% endif %}
 
+{% if spy_total_return is not none %}
+<h2>Benchmark Comparison — SPY Buy &amp; Hold</h2>
+<div class="metrics">
+  <div class="card"><div class="label">SPY Total Return</div>
+    <div class="value {{ 'pos' if spy_total_return >= 0 else 'neg' }}">{{ "%.2f"|format(spy_total_return*100) }}%</div></div>
+  <div class="card"><div class="label">SPY CAGR</div>
+    <div class="value {{ 'pos' if spy_cagr >= 0 else 'neg' }}">{{ "%.2f"|format(spy_cagr*100) }}%</div></div>
+  <div class="card"><div class="label">SPY Max Drawdown</div>
+    <div class="value neg">{{ "%.2f"|format(spy_max_dd*100) }}%</div></div>
+  <div class="card"><div class="label">SPY Sharpe</div>
+    <div class="value">{{ "%.2f"|format(spy_sharpe) }}</div></div>
+  <div class="card"><div class="label">SPY Ann. Volatility</div>
+    <div class="value">{{ "%.2f"|format(spy_ann_vol*100) }}%</div></div>
+  <div class="card"><div class="label">SPY Final Equity</div>
+    <div class="value">${{ "{:,.0f}".format(spy_final_equity) }}</div></div>
+  <div class="card" style="border-left: 3px solid var(--blue);">
+    <div class="label">Alpha (CAGR - SPY)</div>
+    <div class="value {{ 'pos' if alpha >= 0 else 'neg' }}">{{ "%.2f"|format(alpha*100) }}%</div></div>
+</div>
+{% endif %}
+
 <!-- Equity & Drawdown -->
 <h2>Equity Curve &amp; Drawdown</h2>
 <div class="chart-box">{{ equity_chart }}</div>
@@ -831,7 +1374,7 @@ HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 <tbody>
 {% for row in per_symbol_rows %}
 <tr>
-  <td><b>{{ row.symbol }}</b></td>
+  <td><b><a href="reports/{{ row.symbol }}_report.html" style="color:var(--blue);text-decoration:none">{{ row.symbol }}</a></b></td>
   <td>{{ row.n_trades }}</td>
   <td class="{{ 'pos' if row.total_pnl >= 0 else 'neg' }}"
       style="color: {{ '#26a69a' if row.total_pnl >= 0 else '#ef5350' }}">
@@ -876,13 +1419,14 @@ HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 """)
 
 
-def generate_report(equity_df, trade_df, round_trips, stats, per_sym, all_data):
+def generate_report(equity_df, trade_df, round_trips, stats, per_sym, all_data,
+                    spy_df=None):
     """Render the full HTML report and write to disk."""
     # Generate all charts
-    equity_chart = _chart_equity(equity_df)
+    equity_chart = _chart_equity(equity_df, spy_df=spy_df)
     drawdown_chart = _chart_drawdown(equity_df)
     monthly_chart = _chart_monthly_returns(equity_df)
-    yearly_chart = _chart_yearly_returns(equity_df)
+    yearly_chart = _chart_yearly_returns(equity_df, spy_df=spy_df)
     symbol_pnl_chart = _chart_symbol_pnl(per_sym)
     trade_dist_chart = _chart_trade_distribution(round_trips)
     exit_chart = _chart_exit_reasons(round_trips)
@@ -923,21 +1467,51 @@ def main():
     print("  UT Bot + HMA/EMA Multi-Symbol Backtest")
     print("=" * 60)
 
-    # 1. Load data & indicators
-    all_data = load_all_data()
+    # 1. Load data & indicators (stocks only, ETFs excluded)
+    all_data = load_all_data(exclude_etfs=True)
 
-    # 2. Run simulation
+    # ══════════════════════════════════════════════════════════
+    # A) Per-Symbol Full-Position Backtests
+    # ══════════════════════════════════════════════════════════
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"\n{'─'*60}")
+    print(f"  Per-symbol full-position backtests → {REPORTS_DIR}/")
+    print(f"{'─'*60}")
+    sym_summary: list[dict] = []
+    for sym in sorted(all_data.keys()):
+        df = all_data[sym]
+        eq, tdf, rts = run_single_backtest(df, sym)
+        out = generate_single_report(sym, df, eq, tdf, rts)
+
+        # Quick summary for console
+        total_ret = eq["equity"].iloc[-1] / eq["equity"].iloc[0] - 1
+        sym_summary.append(dict(symbol=sym, ret=total_ret, trades=len(rts)))
+        print(f"  {sym:6s}  ret={total_ret*100:+7.1f}%  trades={len(rts):4d}  → {out.name}")
+
+    print(f"[per-sym] {len(sym_summary)} symbol reports written to {REPORTS_DIR}/")
+
+    # ══════════════════════════════════════════════════════════
+    # B) Portfolio Backtest (5 % allocation per symbol)
+    # ══════════════════════════════════════════════════════════
+    print(f"\n{'─'*60}")
+    print(f"  Portfolio backtest (5% allocation, stocks only)")
+    print(f"{'─'*60}")
+
+    # 2. Run portfolio simulation
     equity_df, trade_df = run_backtest(all_data)
 
     # 3. Build round-trip trades
     round_trips = build_round_trips(trade_df)
     print(f"[stat] {len(round_trips)} round-trip trades built")
 
-    # 4. Compute stats
-    stats = compute_overall_stats(equity_df, round_trips)
+    # 4. Load SPY benchmark
+    spy_df = load_spy_benchmark(equity_df.index[0], equity_df.index[-1])
+
+    # 5. Compute stats (with SPY comparison)
+    stats = compute_overall_stats(equity_df, round_trips, spy_df=spy_df)
     per_sym = compute_per_symbol_stats(round_trips)
 
-    # 5. Create vectorbt portfolio (for cross-validation)
+    # 6. Create vectorbt portfolio (for cross-validation)
     pf = create_vbt_portfolio(all_data, equity_df, trade_df)
     if pf is not None:
         try:
@@ -947,12 +1521,15 @@ def main():
         except Exception as e:
             print(f"[vbt]  Stats extraction warning: {e}")
 
-    # 6. Generate HTML report
-    generate_report(equity_df, trade_df, round_trips, stats, per_sym, all_data)
+    # 7. Generate portfolio HTML report
+    generate_report(equity_df, trade_df, round_trips, stats, per_sym, all_data,
+                    spy_df=spy_df)
 
     print("=" * 60)
     print(f"  DONE — Total Return: {stats['total_return']*100:.2f}%  |  "
           f"CAGR: {stats['cagr']*100:.2f}%  |  Max DD: {stats['max_drawdown']*100:.2f}%")
+    print(f"  Portfolio report:  {OUTPUT_FILE}")
+    print(f"  Per-symbol reports: {REPORTS_DIR}/ ({len(sym_summary)} files)")
     print("=" * 60)
 
 
