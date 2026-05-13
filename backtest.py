@@ -10,7 +10,9 @@ Strategy:
             → execute at NEXT day's open price
             Position size = 5% of current equity (compounding, max 20 concurrent)
             Cooldown: 3 days after stop-out before re-entering same symbol
-  - Exit:   +20% → sell all  |  breakeven stop (once +10%, stop at entry price)
+            Max 2 entries per buy-environment episode (same symbol)
+  - Exit:   TP at 5×ATR from entry (adaptive per symbol)
+            Breakeven stop: once profit ≥ 2.5×ATR, stop moves to entry price
   - Stop-loss: Close < HMA(100)  OR  Close < EMA(200)  OR  UT Bot Sell env
 
 Usage:
@@ -45,14 +47,17 @@ UT_K = 2.5
 HMA_LENGTH = 100
 EMA_LENGTH = 200
 
-# Profit-taking & breakeven stop
-TP_PCT = 0.20                       # +20 % → sell all
-BE_TRIGGER_PCT = 0.10               # once pnl ≥ +10 %, activate breakeven stop
+# ATR-adaptive profit-taking & breakeven stop
+# TP target  = entry_price × (1 + TP_ATR_MULT × ATR / entry_price)
+# BE trigger = entry_price × (1 + BE_ATR_MULT × ATR / entry_price)
+TP_ATR_MULT = 4.0                   # take profit at 5× ATR from entry
+BE_ATR_MULT = 2.0                   # activate breakeven stop at 2.5× ATR (half of TP)
 BE_STOP_PCT = 0.0                   # breakeven stop at entry price (0 % profit)
 
 # Entry filters
 COOLDOWN_DAYS = 3                   # days to wait after stop-out before re-entering same symbol
 BUY_ENV_MIN_DAYS = 2                # buy environment must persist ≥ N days before entry
+MAX_ENTRIES_PER_ENV = 3             # max entries per buy-environment episode (same symbol)
 
 REPORTS_DIR = Path("reports")       # per-symbol reports
 
@@ -67,7 +72,7 @@ ETF_SYMBOLS = {
 
 # Blacklisted Symbols
 BLACKLIST_SYMBOLS = {
-    "BMNR", "BAC", "CLSK", "ERNA", "GME", "MRVL", "QBTS", "QUBT", "POET", "SGHC"
+    "BMNR", "BAC", "CLSK", "ERNA", "GME", "MRVL", "QBTS", "QUBT", "POET", "SGHC", "MARA", "NOVT", "NVTS", "SMBS"
 }
 
 # ── File-ownership helper (when running under sudo) ──────────────────────────
@@ -132,7 +137,7 @@ def calc_ut_bot(close: pd.Series, high: pd.Series, low: pd.Series,
     sell_env = close < trailing_stop
     # Buy signal: close crosses above the trailing stop (crossover)
     buy_signal = buy_env & (~buy_env.shift(1, fill_value=False))
-    return trailing_stop, buy_env, sell_env, buy_signal
+    return trailing_stop, buy_env, sell_env, buy_signal, atr
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -163,12 +168,13 @@ def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
         # Indicators
         df["hma"] = ta.hma(df["close"], length=HMA_LENGTH)
         df["ema200"] = ta.ema(df["close"], length=EMA_LENGTH)
-        ts, buy_env, sell_env, buy_signal = calc_ut_bot(
+        ts, buy_env, sell_env, buy_signal, atr_series = calc_ut_bot(
             df["close"], df["high"], df["low"])
         df["ut_stop"] = ts
         df["ut_buy"] = buy_env
         df["ut_sell"] = sell_env
         df["ut_buy_signal"] = buy_signal
+        df["atr"] = atr_series
 
         # ADX(14)
         adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
@@ -184,6 +190,10 @@ def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
             (~df["ut_buy"]).cumsum()
         ).cumsum()
         df["buy_env_days"] = buy_streak
+
+        # Buy episode ID: increments each time a new buy-env period starts
+        new_episode = df["ut_buy"] & (~df["ut_buy"].shift(1, fill_value=False))
+        df["buy_episode_id"] = new_episode.cumsum()
 
         # Volume filter: today's volume > 20-day SMA of volume
         df["vol_sma20"] = df["volume"].rolling(20).mean()
@@ -221,15 +231,20 @@ class Position:
         "symbol", "entry_price", "entry_date",
         "initial_shares", "remaining_shares",
         "breakeven_active",
+        "tp_pct", "be_trigger_pct",
     )
 
-    def __init__(self, symbol, entry_price, entry_date, shares):
+    def __init__(self, symbol, entry_price, entry_date, shares, entry_atr: float = 0.0):
         self.symbol = symbol
         self.entry_price = entry_price
         self.entry_date = entry_date
         self.initial_shares = shares
         self.remaining_shares = shares
-        self.breakeven_active = False      # set True once pnl ≥ BE_TRIGGER_PCT
+        self.breakeven_active = False
+        # ATR-adaptive thresholds (computed once at entry)
+        atr_pct = entry_atr / entry_price if entry_price > 0 else 0.05
+        self.tp_pct = TP_ATR_MULT * atr_pct          # e.g. 5 × 3% = 15%
+        self.be_trigger_pct = BE_ATR_MULT * atr_pct   # e.g. 2.5 × 3% = 7.5%
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -261,6 +276,8 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
     pending_entries: set[str] = set()
     # Cooldown tracker: sym → earliest date allowed to re-enter
     cooldown_until: dict[str, pd.Timestamp] = {}
+    # Per buy-environment episode entry counter: (sym, episode_id) → count
+    episode_entries: dict[tuple[str, int], int] = {}
 
     for date in all_dates:
         closed_today: set[str] = set()
@@ -299,13 +316,18 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
 
             cost = shares * open_price
             cash -= cost
-            positions[sym] = Position(sym, open_price, date, shares)
+            entry_atr = df.loc[date, "atr"] if not np.isnan(df.loc[date, "atr"]) else 0.0
+            positions[sym] = Position(sym, open_price, date, shares, entry_atr)
             trade_log.append(dict(
                 symbol=sym, date=date, side="BUY",
                 shares=shares, price=open_price,
                 reason="ENTRY", pnl_pct=0.0,
                 entry_price=open_price, entry_date=date,
             ))
+            # Increment episode entry counter
+            ep_id = int(df.loc[date, "buy_episode_id"])
+            key = (sym, ep_id)
+            episode_entries[key] = episode_entries.get(key, 0) + 1
         # Clear all pending (one-shot signals, execute or discard)
         pending_entries.clear()
 
@@ -319,8 +341,8 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
             price = row["close"]
             pnl_pct = (price - pos.entry_price) / pos.entry_price
 
-            # Activate breakeven stop once profit ≥ trigger
-            if not pos.breakeven_active and pnl_pct >= BE_TRIGGER_PCT:
+            # Activate breakeven stop once profit ≥ ATR-based trigger
+            if not pos.breakeven_active and pnl_pct >= pos.be_trigger_pct:
                 pos.breakeven_active = True
 
             # ─ Breakeven stop: once activated, if price drops back to entry → exit
@@ -357,15 +379,15 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
                 cooldown_until[sym] = date + pd.Timedelta(days=COOLDOWN_DAYS)
                 continue
 
-            # ─ Take profit: +20 % → sell all
-            if pnl_pct >= TP_PCT:
+            # ─ ATR-adaptive take profit → sell all
+            if pnl_pct >= pos.tp_pct:
                 sell_n = pos.remaining_shares
                 if sell_n > 0:
                     cash += sell_n * price
                     trade_log.append(dict(
                         symbol=sym, date=date, side="SELL",
                         shares=sell_n, price=price,
-                        reason="TP_20%", pnl_pct=pnl_pct,
+                        reason=f"TP_{pos.tp_pct*100:.0f}%", pnl_pct=pnl_pct,
                         entry_price=pos.entry_price, entry_date=pos.entry_date,
                     ))
                     pos.remaining_shares = 0
@@ -386,6 +408,10 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
             if date not in df.index:
                 continue
             if df.loc[date, "entry_ok"]:
+                # Episode entry limit
+                ep_id = int(df.loc[date, "buy_episode_id"])
+                if episode_entries.get((sym, ep_id), 0) >= MAX_ENTRIES_PER_ENV:
+                    continue
                 pending_entries.add(sym)
 
         # ── Phase 3: Record equity ───────────────────────────────────────
@@ -628,6 +654,7 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
     pos: Position | None = None
     pending = False        # signal fired at close, buy at next open
     cooldown_end: pd.Timestamp | None = None  # cooldown after stop-out
+    episode_entries: dict[int, int] = {}       # episode_id → entry count
 
     equity_records: list[dict] = []
     trade_log: list[dict] = []
@@ -641,13 +668,16 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
                 if shares > 0:
                     cost = shares * op
                     cash -= cost
-                    pos = Position(symbol, op, date, shares)
+                    entry_atr = df.loc[date, "atr"] if not np.isnan(df.loc[date, "atr"]) else 0.0
+                    pos = Position(symbol, op, date, shares, entry_atr)
                     trade_log.append(dict(
                         symbol=symbol, date=date, side="BUY",
                         shares=shares, price=op,
                         reason="ENTRY", pnl_pct=0.0,
                         entry_price=op, entry_date=date,
                     ))
+                    ep_id = int(df.loc[date, "buy_episode_id"])
+                    episode_entries[ep_id] = episode_entries.get(ep_id, 0) + 1
             pending = False
 
         # ── Phase 1: Exits at close ───────────────────────────────────────
@@ -656,8 +686,8 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
             pnl_pct = (close_price - pos.entry_price) / pos.entry_price
             closed = False
 
-            # Activate breakeven stop
-            if not pos.breakeven_active and pnl_pct >= BE_TRIGGER_PCT:
+            # Activate breakeven stop (ATR-adaptive trigger)
+            if not pos.breakeven_active and pnl_pct >= pos.be_trigger_pct:
                 pos.breakeven_active = True
 
             # Breakeven stop
@@ -688,14 +718,14 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
                 closed = True
                 cooldown_end = date + pd.Timedelta(days=COOLDOWN_DAYS)
 
-            # Take profit: +20 % → sell all
-            elif pnl_pct >= TP_PCT:
+            # ATR-adaptive take profit → sell all
+            elif pnl_pct >= pos.tp_pct:
                 sell_n = pos.remaining_shares
                 cash += sell_n * close_price
                 trade_log.append(dict(
                     symbol=symbol, date=date, side="SELL",
                     shares=sell_n, price=close_price,
-                    reason="TP_20%", pnl_pct=pnl_pct,
+                    reason=f"TP_{pos.tp_pct*100:.0f}%", pnl_pct=pnl_pct,
                     entry_price=pos.entry_price, entry_date=pos.entry_date,
                 ))
                 pos.remaining_shares = 0
@@ -708,8 +738,13 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
         pending = False
         if pos is None and df.loc[date, "entry_ok"]:
             # Respect cooldown
-            if cooldown_end is None or date >= cooldown_end:
-                pending = True
+            if cooldown_end is not None and date < cooldown_end:
+                pass
+            else:
+                # Episode entry limit
+                ep_id = int(df.loc[date, "buy_episode_id"])
+                if episode_entries.get(ep_id, 0) < MAX_ENTRIES_PER_ENV:
+                    pending = True
 
         # ── Phase 3: Record equity ────────────────────────────────────────
         held_value = (pos.remaining_shares * close_price) if pos else 0.0
@@ -914,11 +949,16 @@ def _chart_yearly_returns(equity_df: pd.DataFrame,
 def _chart_exit_reasons(round_trips: list[dict]) -> str:
     if not round_trips:
         return ""
-    reasons = pd.Series([t["exit_reason"] for t in round_trips]).value_counts()
+    # Consolidate ATR-adaptive TP_xx% variants into a single "TP" category
+    raw = [t["exit_reason"] for t in round_trips]
+    consolidated = [r if not r.startswith("TP_") else "TP" for r in raw]
+    reasons = pd.Series(consolidated).value_counts()
+    colors = {"STOP": "#ef5350", "TP": "#26a69a", "BE_STOP": "#ff9800"}
+    marker_colors = [colors.get(r, "#9e9e9e") for r in reasons.index]
     fig = go.Figure(go.Pie(
         labels=reasons.index, values=reasons.values,
         hole=0.4, textinfo="label+percent+value",
-        marker_colors=["#ef5350", "#26a69a", "#ff9800", "#2196f3", "#9c27b0"],
+        marker_colors=marker_colors,
     ))
     fig.update_layout(title="Exit Reason Breakdown", height=350,
                       margin=dict(l=30, r=30, t=40, b=30))
@@ -1303,8 +1343,8 @@ HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 <h3>Strategy Rules</h3>
 <ul>
   <li><b>Indicators:</b> UT Bot (ATR {{ atr_period }}, K={{ ut_k }}), HMA({{ hma_len }}), EMA({{ ema_len }})</li>
-  <li><b>Entry:</b> UT Bot <em>Buy environment (&ge;2 days)</em> AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) AND ADX(14) &gt; 20 AND Volume &gt; 20d SMA &rarr; buy at <b>next day's open</b> &mdash; allocate {{ pos_pct }}% of <b>current equity</b> per position (compounding, max 20 concurrent). <b>Cooldown:</b> 3 days after stop-out before re-entering same symbol.</li>
-  <li><b>Take profit:</b> +20% &rarr; sell all. <b>Breakeven stop:</b> once profit &ge; +10%, stop-loss moves to entry price (保本止损).</li>
+  <li><b>Entry:</b> UT Bot <em>Buy environment (&ge;2 days)</em> AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) AND ADX(14) &gt; 20 AND Volume &gt; 20d SMA &rarr; buy at <b>next day's open</b> &mdash; allocate {{ pos_pct }}% of <b>current equity</b> per position (compounding, max 20 concurrent). <b>Cooldown:</b> 3 days after stop-out. <b>Max 2 entries</b> per buy-environment episode.</li>
+  <li><b>Take profit:</b> ATR-adaptive &mdash; sell all at <b>5&times;ATR</b> from entry (varies per symbol &amp; trade). <b>Breakeven stop:</b> once profit &ge; <b>2.5&times;ATR</b>, stop-loss moves to entry price (保本止损).</li>
   <li><b>Stop-loss:</b> Close &lt; HMA({{ hma_len }}) OR Close &lt; EMA({{ ema_len }}) OR UT Bot enters <em>Sell</em> environment</li>
 </ul>
 <p style="margin-top:8px;color:var(--muted);">Data: {{ n_symbols }} symbols, {{ start_date }} &rarr; {{ end_date }} ({{ total_years|round(1) }} years). Initial capital ${{ "{:,.0f}".format(initial_capital) }}.</p>
