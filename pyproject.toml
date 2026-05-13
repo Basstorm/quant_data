@@ -3,8 +3,13 @@ name = "ib-kline"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "ib-insync>=0.9.86",
     "pandas>=2.3.3",
+    "vectorbt",
+    "pandas-ta",
+    "plotly",
+    "jinja2",
+    "kaleido",
 ]
