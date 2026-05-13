@@ -78,7 +78,7 @@ ETF_SYMBOLS = {
 
 # Blacklisted Symbols
 BLACKLIST_SYMBOLS = {
-    "BMNR", "BAC", "CLSK", "ERNA", "GME", "MRVL", "QBTS", "QUBT", "POET", "SGHC", "MARA", "NOVT", "NVTS", "SMBS"
+    "BMNR", "BAC", "CLSK", "ERNA", "GME", "MRVL", "QBTS", "QUBT", "POET", "SGHC", "MARA", "NOVT", "NVTS", "SMBS", "NOK", "ALKS", "ARMK"
 }
 
 # ── File-ownership helper (when running under sudo) ──────────────────────────

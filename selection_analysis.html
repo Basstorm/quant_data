@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stock Selection Analysis — Kept vs Removed</title>
+<style>
+  :root { --bg: #f8f9fa; --card: #ffffff; --border: #e0e0e0;
+          --text: #212121; --muted: #757575; --up: #26a69a; --down: #ef5350;
+          --blue: #2196f3; --orange: #ff9800; --radius: 8px; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+         sans-serif; background: var(--bg); color: var(--text);
+         max-width: 1440px; margin: 0 auto; padding: 24px; line-height: 1.5; }
+  h1 { font-size: 1.8rem; margin-bottom: 4px; }
+  h2 { font-size: 1.3rem; margin: 32px 0 16px; padding-bottom: 8px;
+       border-bottom: 2px solid var(--blue); }
+  h3 { font-size: 1.1rem; margin: 20px 0 12px; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+             gap: 12px; margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--border);
+          border-radius: var(--radius); padding: 16px; }
+  .card .label { font-size: 0.78rem; color: var(--muted); text-transform: uppercase;
+                 letter-spacing: 0.5px; }
+  .card .value { font-size: 1.5rem; font-weight: 700; margin-top: 4px; }
+  .card .value.pos { color: var(--up); }
+  .card .value.neg { color: var(--down); }
+  .card .detail { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+
+  /* Conclusion box */
+  .conclusion-box { background: #e3f2fd; border: 2px solid var(--blue);
+                    border-radius: var(--radius); padding: 20px; margin-bottom: 24px; }
+  .conclusion-box h3 { margin-top: 0; color: #1565c0; }
+  .conclusion-box ul { margin-left: 20px; margin-top: 8px; }
+  .conclusion-box li { margin-bottom: 6px; }
+  .conclusion-box .highlight { background: #fff9c4; padding: 2px 6px; border-radius: 3px;
+                               font-weight: 600; }
+
+  /* Warning box */
+  .warn-box { background: #fff3e0; border: 2px solid var(--orange);
+              border-radius: var(--radius); padding: 20px; margin-bottom: 24px; }
+  .warn-box h3 { margin-top: 0; color: #e65100; }
+  .warn-box ul { margin-left: 20px; margin-top: 8px; }
+  .warn-box li { margin-bottom: 4px; }
+
+  /* Comparison grid */
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  @media (max-width: 900px) { .compare-grid { grid-template-columns: 1fr; } }
+  .compare-card { background: var(--card); border: 1px solid var(--border);
+                  border-radius: var(--radius); padding: 16px; }
+  .compare-card.kept { border-left: 4px solid var(--up); }
+  .compare-card.removed { border-left: 4px solid var(--down); }
+  .compare-card h4 { font-size: 0.9rem; margin-bottom: 12px; }
+  .compare-card h4.kept-h { color: var(--up); }
+  .compare-card h4.removed-h { color: var(--down); }
+  .compare-row { display: flex; justify-content: space-between; padding: 4px 0;
+                 border-bottom: 1px solid #f0f0f0; font-size: 0.85rem; }
+  .compare-row:last-child { border-bottom: none; }
+  .compare-row .clabel { color: var(--muted); }
+
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th, td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--border); }
+  th { background: #f1f3f5; font-weight: 600; position: sticky; top: 0; z-index: 1; }
+  td:first-child, th:first-child { text-align: left; }
+  td:nth-child(2), th:nth-child(2) { text-align: left; }
+  tr:hover td { background: #f5f5f5; }
+  .tbl-wrap { max-height: 700px; overflow-y: auto; border: 1px solid var(--border);
+              border-radius: var(--radius); margin-bottom: 24px; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px;
+         font-size: 0.72rem; font-weight: 600; }
+  .tag.kept { background: #e8f5e9; color: #2e7d32; }
+  .tag.removed { background: #ffebee; color: #c62828; }
+
+  /* Filter test table */
+  .filter-table { margin-bottom: 24px; }
+  .filter-table table { font-size: 0.85rem; }
+  .filter-table th { text-align: center; }
+  .filter-table td { text-align: center; }
+  .filter-table td:first-child, .filter-table th:first-child { text-align: left; }
+  .best-row { background: #e8f5e9 !important; }
+  .best-row td { font-weight: 600; }
+
+  /* Bar chart CSS */
+  .bar-chart { margin: 16px 0; }
+  .bar-row { display: flex; align-items: center; margin-bottom: 6px; font-size: 0.82rem; }
+  .bar-label { width: 160px; text-align: right; padding-right: 10px; color: var(--muted); flex-shrink: 0; }
+  .bar-track { flex: 1; height: 22px; background: #f0f0f0; border-radius: 4px; position: relative; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; display: flex; align-items: center;
+              padding-left: 8px; font-size: 0.72rem; font-weight: 600; color: #fff;
+              min-width: 2px; transition: width 0.3s; }
+  .bar-fill.kept-bar { background: var(--up); }
+  .bar-fill.removed-bar { background: var(--down); }
+
+  footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--border);
+           color: var(--muted); font-size: 0.8rem; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>Stock Selection Analysis: Kept vs Removed</h1>
+<p class="subtitle">57 non-ETF symbols analyzed &mdash; 40 Kept / 17 Removed (blacklisted) &mdash; Generated 2026-05-13</p>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Core Conclusions</h2>
+
+<div class="conclusion-box">
+<h3>Key Findings</h3>
+<ul>
+  <li><b>Dollar Volume is the #1 differentiator:</b> Kept stocks have a median full-history daily dollar volume of <span class="highlight">$349M</span> vs Removed at <span class="highlight">$9.4M</span> &mdash; a <b>37&times;</b> difference.</li>
+  <li><b>Kept stocks are profitable; Removed are not:</b> Kept median annualized return <span class="highlight">+27.1%</span> vs Removed <span class="highlight">+1.5%</span>; Kept median Sharpe <span class="highlight">0.45</span> vs Removed <span class="highlight">0.03</span>.</li>
+  <li><b>Kept stocks trend more:</b> Kept spend <span class="highlight">63.3%</span> of time above EMA(200) vs Removed at <span class="highlight">46.1%</span>.</li>
+  <li><b>Removed stocks have deeper drawdowns:</b> Removed median max drawdown <span class="highlight">-95.6%</span> vs Kept <span class="highlight">-78.5%</span>.</li>
+</ul>
+</div>
+
+<div class="conclusion-box">
+<h3>Recommended Selection Criteria</h3>
+<ul>
+  <li><b>Best single filter:</b> Full-history median dollar volume &ge; <span class="highlight">$10M</span> &mdash; cuts 9/17 bad stocks, only loses 3 kept (82% precision).</li>
+  <li><b>Best combo filter:</b> Dollar volume &ge; $5M + Sharpe &ge; 0 + %EMA200 &gt; 50% &mdash; <span class="highlight">91% precision</span> (keeps 32/40, passes only 3/17 removed).</li>
+  <li><b>Simple & practical:</b> Dollar volume &ge; $10M + Sharpe &ge; 0 &mdash; <span class="highlight">90% precision</span> (keeps all 37 kept, passes only 4/17 removed).</li>
+</ul>
+</div>
+
+<div class="warn-box">
+<h3>False Positives in Best Filter</h3>
+<ul>
+  <li>Kept symbols that would be wrongly excluded by "%EMA200 &gt; 50%" filter:
+    <b>CRWV</b> (30%, new stock), <b>AAOI</b> (42%), <b>COIN</b> (45%),
+    <b>RGTI</b> (46%, new stock), <b>SOFI</b> (46%), <b>SMR</b> (46%), <b>IONQ</b> (50%)</li>
+  <li>Most are <em>newer IPOs with short history</em> or <em>crypto-adjacent</em> stocks &mdash; can be manually whitelisted.</li>
+</ul>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Kept vs Removed &mdash; Median Comparison</h2>
+
+<div class="compare-grid">
+  <div class="compare-card kept">
+    <h4 class="kept-h">KEPT (40 symbols)</h4>
+    <div class="compare-row"><span class="clabel">30d Median Dollar Vol</span><span>$1,451,812,686</span></div>
+    <div class="compare-row"><span class="clabel">Full Median Dollar Vol</span><span>$349,240,926</span></div>
+    <div class="compare-row"><span class="clabel">30d ATR%</span><span>5.22%</span></div>
+    <div class="compare-row"><span class="clabel">Full ATR%</span><span>4.49%</span></div>
+    <div class="compare-row"><span class="clabel">Annual Volatility</span><span>56.46%</span></div>
+    <div class="compare-row"><span class="clabel">% Time &gt; EMA(200)</span><span>63.3%</span></div>
+    <div class="compare-row"><span class="clabel">% Time &gt; HMA(100)</span><span>52.8%</span></div>
+    <div class="compare-row"><span class="clabel">Annualized Return</span><span style="color:var(--up);font-weight:600">+27.13%</span></div>
+    <div class="compare-row"><span class="clabel">Raw Sharpe</span><span>0.45</span></div>
+    <div class="compare-row"><span class="clabel">Max Drawdown</span><span style="color:var(--down)">-78.53%</span></div>
+    <div class="compare-row"><span class="clabel">Signal Density</span><span>0.255</span></div>
+    <div class="compare-row"><span class="clabel">Last Price (median)</span><span>$189.88</span></div>
+  </div>
+  <div class="compare-card removed">
+    <h4 class="removed-h">REMOVED (17 symbols)</h4>
+    <div class="compare-row"><span class="clabel">30d Median Dollar Vol</span><span>$184,136,286</span></div>
+    <div class="compare-row"><span class="clabel">Full Median Dollar Vol</span><span>$9,409,263</span></div>
+    <div class="compare-row"><span class="clabel">30d ATR%</span><span>5.09%</span></div>
+    <div class="compare-row"><span class="clabel">Full ATR%</span><span>8.41%</span></div>
+    <div class="compare-row"><span class="clabel">Annual Volatility</span><span>83.88%</span></div>
+    <div class="compare-row"><span class="clabel">% Time &gt; EMA(200)</span><span>46.1%</span></div>
+    <div class="compare-row"><span class="clabel">% Time &gt; HMA(100)</span><span>51.6%</span></div>
+    <div class="compare-row"><span class="clabel">Annualized Return</span><span style="color:var(--muted)">+1.45%</span></div>
+    <div class="compare-row"><span class="clabel">Raw Sharpe</span><span>0.03</span></div>
+    <div class="compare-row"><span class="clabel">Max Drawdown</span><span style="color:var(--down);font-weight:600">-95.55%</span></div>
+    <div class="compare-row"><span class="clabel">Signal Density</span><span>0.197</span></div>
+    <div class="compare-row"><span class="clabel">Last Price (median)</span><span>$21.51</span></div>
+  </div>
+</div>
+
+<!-- Visual bar comparison -->
+<h3>Key Metric Gaps (Median)</h3>
+<div class="card" style="padding:20px; margin-bottom:24px;">
+  <div class="bar-chart">
+    <div class="bar-row">
+      <div class="bar-label">Full Med Dollar Vol</div>
+      <div class="bar-track">
+        <div class="bar-fill kept-bar" style="width:100%">$349M</div>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">&nbsp;</div>
+      <div class="bar-track">
+        <div class="bar-fill removed-bar" style="width:2.7%">$9.4M</div>
+      </div>
+    </div>
+
+    <div style="height:12px"></div>
+
+    <div class="bar-row">
+      <div class="bar-label">Annualized Return</div>
+      <div class="bar-track">
+        <div class="bar-fill kept-bar" style="width:100%">+27.1%</div>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">&nbsp;</div>
+      <div class="bar-track">
+        <div class="bar-fill removed-bar" style="width:5.3%">+1.5%</div>
+      </div>
+    </div>
+
+    <div style="height:12px"></div>
+
+    <div class="bar-row">
+      <div class="bar-label">Raw Sharpe</div>
+      <div class="bar-track">
+        <div class="bar-fill kept-bar" style="width:100%">0.45</div>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">&nbsp;</div>
+      <div class="bar-track">
+        <div class="bar-fill removed-bar" style="width:6.7%">0.03</div>
+      </div>
+    </div>
+
+    <div style="height:12px"></div>
+
+    <div class="bar-row">
+      <div class="bar-label">% Time &gt; EMA200</div>
+      <div class="bar-track">
+        <div class="bar-fill kept-bar" style="width:63.3%">63.3%</div>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">&nbsp;</div>
+      <div class="bar-track">
+        <div class="bar-fill removed-bar" style="width:46.1%">46.1%</div>
+      </div>
+    </div>
+
+    <div style="height:12px"></div>
+
+    <div class="bar-row">
+      <div class="bar-label">Max Drawdown</div>
+      <div class="bar-track">
+        <div class="bar-fill kept-bar" style="width:78.5%">-78.5%</div>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">&nbsp;</div>
+      <div class="bar-track">
+        <div class="bar-fill removed-bar" style="width:95.6%">-95.6%</div>
+      </div>
+    </div>
+  </div>
+  <p style="font-size:0.75rem; color:var(--muted); margin-top:8px;">
+    Green = Kept (40), Red = Removed (17). Bar widths are relative within each metric pair.
+  </p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Multi-Criteria Filter Tests</h2>
+
+<div class="filter-table">
+<div class="tbl-wrap" style="max-height:none;">
+<table>
+  <thead>
+    <tr>
+      <th style="text-align:left; min-width:280px;">Filter Criteria</th>
+      <th>Kept Pass</th>
+      <th>Removed Pass</th>
+      <th>Kept Missed</th>
+      <th>Removed Cut</th>
+      <th>Precision</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="text-align:left">DolVol &ge; $10M</td>
+      <td>37</td><td>8</td><td>3</td><td>9</td><td>82%</td>
+    </tr>
+    <tr>
+      <td style="text-align:left">DolVol &ge; $10M + Sharpe &ge; 0</td>
+      <td>37</td><td>4</td><td>3</td><td>13</td><td><b>90%</b></td>
+    </tr>
+    <tr>
+      <td style="text-align:left">DolVol &ge; $10M + %EMA &gt; 50%</td>
+      <td>31</td><td>5</td><td>9</td><td>12</td><td>86%</td>
+    </tr>
+    <tr>
+      <td style="text-align:left">DolVol &ge; $5M + Sharpe &ge; 0.05</td>
+      <td>36</td><td>4</td><td>4</td><td>13</td><td>90%</td>
+    </tr>
+    <tr class="best-row">
+      <td style="text-align:left">DolVol &ge; $5M + Sharpe &ge; 0 + %EMA &gt; 50%</td>
+      <td>32</td><td>3</td><td>8</td><td>14</td><td><b>91%</b></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+<p style="font-size:0.78rem; color:var(--muted); margin-top:8px;">
+  Precision = Kept Pass / (Kept Pass + Removed Pass). Higher is better.
+  "DolVol" = full-history median daily dollar volume. Green row = best overall precision.
+</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Single-Factor Threshold Sensitivity</h2>
+
+<div class="compare-grid">
+  <!-- Dollar Volume thresholds -->
+  <div class="card">
+    <h3>A) Full-History Median Dollar Volume</h3>
+    <table>
+      <thead><tr><th style="text-align:left">Threshold</th><th>Kept Pass</th><th>Removed Pass</th><th>Would Cut</th></tr></thead>
+      <tbody>
+        <tr><td style="text-align:left">$1,000,000</td><td>40</td><td>14</td><td>0</td></tr>
+        <tr><td style="text-align:left">$5,000,000</td><td>39</td><td>10</td><td>1</td></tr>
+        <tr style="background:#e8f5e9"><td style="text-align:left"><b>$10,000,000</b></td><td><b>37</b></td><td><b>8</b></td><td><b>3</b></td></tr>
+        <tr><td style="text-align:left">$20,000,000</td><td>32</td><td>6</td><td>8</td></tr>
+        <tr><td style="text-align:left">$50,000,000</td><td>31</td><td>5</td><td>9</td></tr>
+        <tr><td style="text-align:left">$100,000,000</td><td>25</td><td>3</td><td>15</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- EMA thresholds -->
+  <div class="card">
+    <h3>B) % Time Above EMA(200)</h3>
+    <table>
+      <thead><tr><th style="text-align:left">Threshold</th><th>Kept Pass</th><th>Removed Pass</th><th>Would Cut</th></tr></thead>
+      <tbody>
+        <tr><td style="text-align:left">40%</td><td>39</td><td>12</td><td>1</td></tr>
+        <tr><td style="text-align:left">45%</td><td>38</td><td>10</td><td>2</td></tr>
+        <tr style="background:#e8f5e9"><td style="text-align:left"><b>50%</b></td><td><b>33</b></td><td><b>7</b></td><td><b>7</b></td></tr>
+        <tr><td style="text-align:left">55%</td><td>28</td><td>6</td><td>12</td></tr>
+        <tr><td style="text-align:left">60%</td><td>23</td><td>4</td><td>17</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Sharpe thresholds -->
+  <div class="card">
+    <h3>C) Raw Sharpe Ratio</h3>
+    <table>
+      <thead><tr><th style="text-align:left">Threshold</th><th>Kept Pass</th><th>Removed Pass</th><th>Would Cut</th></tr></thead>
+      <tbody>
+        <tr><td style="text-align:left">-0.10</td><td>40</td><td>14</td><td>0</td></tr>
+        <tr style="background:#e8f5e9"><td style="text-align:left"><b>0.00</b></td><td><b>40</b></td><td><b>9</b></td><td><b>0</b></td></tr>
+        <tr><td style="text-align:left">0.05</td><td>37</td><td>8</td><td>3</td></tr>
+        <tr><td style="text-align:left">0.10</td><td>37</td><td>7</td><td>3</td></tr>
+        <tr><td style="text-align:left">0.15</td><td>33</td><td>5</td><td>7</td></tr>
+        <tr><td style="text-align:left">0.20</td><td>32</td><td>5</td><td>8</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ATR thresholds -->
+  <div class="card">
+    <h3>D) Full-History ATR% (lower = less volatile)</h3>
+    <table>
+      <thead><tr><th style="text-align:left">Threshold</th><th>Kept Pass</th><th>Removed Pass</th><th>Would Cut</th></tr></thead>
+      <tbody>
+        <tr><td style="text-align:left">&le; 2.0%</td><td>1</td><td>1</td><td>39</td></tr>
+        <tr><td style="text-align:left">&le; 3.0%</td><td>9</td><td>4</td><td>31</td></tr>
+        <tr><td style="text-align:left">&le; 4.0%</td><td>15</td><td>5</td><td>25</td></tr>
+        <tr><td style="text-align:left">&le; 5.0%</td><td>23</td><td>7</td><td>17</td></tr>
+        <tr><td style="text-align:left">&le; 6.0%</td><td>25</td><td>8</td><td>15</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:0.75rem; color:var(--muted); margin-top:8px;">
+      ATR% is a poor discriminator &mdash; high-beta tech is our alpha source.
+    </p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>All 57 Symbols &mdash; Ranked by 30-Day Median Dollar Volume</h2>
+
+<div class="tbl-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>#</th><th>Symbol</th><th>Status</th><th>30d Med DVol</th><th>30d Avg DVol</th>
+      <th>ATR%</th><th>%&gt;EMA200</th><th>Ann. Return</th><th>Sharpe</th><th>Max DD</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>TSLA</td><td><span class="tag kept">KEPT</span></td><td>$17,834,738,426</td><td>$18,803,309,882</td><td>4.5%</td><td>66%</td><td style="color:var(--up)">+44.7%</td><td>0.79</td><td>-73.6%</td></tr>
+    <tr><td>2</td><td>NVDA</td><td><span class="tag kept">KEPT</span></td><td>$17,827,696,883</td><td>$19,746,132,686</td><td>4.2%</td><td>68%</td><td style="color:var(--up)">+29.2%</td><td>0.51</td><td>-86.7%</td></tr>
+    <tr><td>3</td><td>MU</td><td><span class="tag kept">KEPT</span></td><td>$12,406,322,324</td><td>$15,924,616,513</td><td>4.0%</td><td>62%</td><td style="color:var(--up)">+34.2%</td><td>0.70</td><td>-73.8%</td></tr>
+    <tr><td>4</td><td>SNDK</td><td><span class="tag kept">KEPT</span></td><td>$8,331,515,010</td><td>$10,036,340,420</td><td>8.3%</td><td>100%</td><td style="color:var(--up)">+6004.0%</td><td>56.35</td><td>-25.9%</td></tr>
+    <tr><td>5</td><td>AMD</td><td><span class="tag kept">KEPT</span></td><td>$8,262,911,929</td><td>$8,598,444,763</td><td>4.6%</td><td>75%</td><td style="color:var(--up)">+67.1%</td><td>1.13</td><td>-65.4%</td></tr>
+    <tr><td>6</td><td>MSFT</td><td><span class="tag kept">KEPT</span></td><td>$7,465,586,429</td><td>$7,990,087,093</td><td>8.8%</td><td>64%</td><td style="color:var(--up)">+8.1%</td><td>0.28</td><td>-75.8%</td></tr>
+    <tr><td>7</td><td>INTC</td><td><span class="tag kept">KEPT</span></td><td>$6,693,007,511</td><td>$8,680,453,795</td><td>2.9%</td><td>54%</td><td style="color:var(--up)">+5.4%</td><td>0.14</td><td>-73.5%</td></tr>
+    <tr><td>8</td><td>AMZN</td><td><span class="tag kept">KEPT</span></td><td>$6,032,754,917</td><td>$6,588,610,501</td><td>3.1%</td><td>75%</td><td style="color:var(--up)">+27.0%</td><td>0.69</td><td>-65.3%</td></tr>
+    <tr><td>9</td><td>AAPL</td><td><span class="tag kept">KEPT</span></td><td>$5,576,036,378</td><td>$6,309,059,537</td><td>2.7%</td><td>76%</td><td style="color:var(--up)">+27.2%</td><td>0.78</td><td>-62.1%</td></tr>
+    <tr><td>10</td><td>META</td><td><span class="tag kept">KEPT</span></td><td>$5,456,306,996</td><td>$6,353,412,836</td><td>2.8%</td><td>80%</td><td style="color:var(--up)">+26.0%</td><td>0.68</td><td>-76.7%</td></tr>
+    <tr><td>11</td><td>AVGO</td><td><span class="tag kept">KEPT</span></td><td>$4,616,031,519</td><td>$4,752,438,018</td><td>3.0%</td><td>85%</td><td style="color:var(--up)">+40.6%</td><td>1.02</td><td>-48.8%</td></tr>
+    <tr><td>12</td><td>GOOGL</td><td><span class="tag kept">KEPT</span></td><td>$4,531,101,783</td><td>$4,868,283,106</td><td>2.4%</td><td>78%</td><td style="color:var(--up)">+21.0%</td><td>0.68</td><td>-65.3%</td></tr>
+    <tr><td>13</td><td>PLTR</td><td><span class="tag kept">KEPT</span></td><td>$4,269,656,191</td><td>$4,481,213,637</td><td>5.4%</td><td>63%</td><td style="color:var(--up)">+46.6%</td><td>0.71</td><td>-79.1%</td></tr>
+    <tr><td>14</td><td>TSM</td><td><span class="tag kept">KEPT</span></td><td>$3,602,980,154</td><td>$3,530,790,678</td><td>2.8%</td><td>69%</td><td style="color:var(--up)">+13.7%</td><td>0.37</td><td>-74.2%</td></tr>
+    <tr><td>15</td><td>ORCL</td><td><span class="tag kept">KEPT</span></td><td>$2,884,100,417</td><td>$3,366,839,075</td><td>2.6%</td><td>69%</td><td style="color:var(--up)">+11.1%</td><td>0.33</td><td>-58.4%</td></tr>
+    <tr><td>16</td><td>GOOG</td><td><span class="tag kept">KEPT</span></td><td>$2,823,062,919</td><td>$3,126,540,736</td><td>2.3%</td><td>80%</td><td style="color:var(--up)">+27.4%</td><td>0.95</td><td>-44.6%</td></tr>
+    <tr><td>17</td><td>LITE</td><td><span class="tag kept">KEPT</span></td><td>$2,648,195,045</td><td>$2,966,652,587</td><td>4.4%</td><td>64%</td><td style="color:var(--up)">+44.6%</td><td>0.80</td><td>-66.9%</td></tr>
+    <tr><td>18</td><td>NFLX</td><td><span class="tag kept">KEPT</span></td><td>$2,307,809,317</td><td>$2,724,045,650</td><td>4.0%</td><td>70%</td><td style="color:var(--up)">+29.5%</td><td>0.55</td><td>-88.3%</td></tr>
+    <tr><td>19</td><td>MRVL</td><td><span class="tag removed">REMOVED</span></td><td>$2,135,111,656</td><td>$2,383,092,429</td><td>9.2%</td><td>60%</td><td style="color:var(--up)">+12.2%</td><td>0.25</td><td>-86.5%</td></tr>
+    <tr><td>20</td><td>CRWV</td><td><span class="tag kept">KEPT</span></td><td>$2,116,435,525</td><td>$2,332,408,167</td><td>8.4%</td><td>30%</td><td style="color:var(--up)">+73.4%</td><td>0.74</td><td>-36.5%</td></tr>
+    <tr><td>21</td><td>MSTR</td><td><span class="tag kept">KEPT</span></td><td>$1,595,992,301</td><td>$1,878,889,053</td><td>6.7%</td><td>59%</td><td style="color:var(--up)">+30.6%</td><td>0.12</td><td>-89.3%</td></tr>
+    <tr><td>22</td><td>ASML</td><td><span class="tag kept">KEPT</span></td><td>$1,307,633,072</td><td>$1,531,306,246</td><td>2.9%</td><td>71%</td><td style="color:var(--up)">+18.2%</td><td>0.44</td><td>-80.5%</td></tr>
+    <tr><td>23</td><td>COIN</td><td><span class="tag kept">KEPT</span></td><td>$1,186,714,649</td><td>$1,257,389,961</td><td>7.7%</td><td>45%</td><td style="color:var(--up)">+3.2%</td><td>0.04</td><td>-84.8%</td></tr>
+    <tr><td>24</td><td>IREN</td><td><span class="tag kept">KEPT</span></td><td>$1,138,666,183</td><td>$1,406,329,116</td><td>10.6%</td><td>59%</td><td style="color:var(--up)">+103.6%</td><td>0.88</td><td>-79.1%</td></tr>
+    <tr><td>25</td><td>RKLB</td><td><span class="tag kept">KEPT</span></td><td>$1,120,891,172</td><td>$1,450,503,523</td><td>7.0%</td><td>54%</td><td style="color:var(--up)">+63.9%</td><td>0.79</td><td>-83.0%</td></tr>
+    <tr><td>26</td><td>GLW</td><td><span class="tag kept">KEPT</span></td><td>$1,080,971,217</td><td>$1,301,074,735</td><td>3.2%</td><td>61%</td><td style="color:var(--up)">+14.1%</td><td>0.34</td><td>-86.4%</td></tr>
+    <tr><td>27</td><td>AAOI</td><td><span class="tag kept">KEPT</span></td><td>$1,036,603,800</td><td>$1,177,698,694</td><td>7.1%</td><td>42%</td><td style="color:var(--up)">+19.1%</td><td>0.21</td><td>-98.5%</td></tr>
+    <tr><td>28</td><td>STX</td><td><span class="tag kept">KEPT</span></td><td>$1,012,543,434</td><td>$1,624,575,493</td><td>3.7%</td><td>64%</td><td style="color:var(--up)">+21.0%</td><td>0.47</td><td>-89.1%</td></tr>
+    <tr><td>29</td><td>BAC</td><td><span class="tag removed">REMOVED</span></td><td>$984,026,927</td><td>$1,072,863,862</td><td>2.8%</td><td>57%</td><td style="color:var(--down)">-1.2%</td><td>-0.03</td><td>-96.5%</td></tr>
+    <tr><td>30</td><td>NOK</td><td><span class="tag removed">REMOVED</span></td><td>$907,583,834</td><td>$977,166,394</td><td>3.0%</td><td>46%</td><td style="color:var(--down)">-2.2%</td><td>-0.05</td><td>-95.9%</td></tr>
+    <tr><td>31</td><td>BKNG</td><td><span class="tag kept">KEPT</span></td><td>$813,785,430</td><td>$834,550,361</td><td>3.4%</td><td>72%</td><td style="color:var(--up)">+31.6%</td><td>0.28</td><td>-81.8%</td></tr>
+    <tr><td>32</td><td>ASTS</td><td><span class="tag kept">KEPT</span></td><td>$797,601,049</td><td>$925,754,767</td><td>8.4%</td><td>55%</td><td style="color:var(--up)">+40.8%</td><td>0.38</td><td>-91.1%</td></tr>
+    <tr><td>33</td><td>SOFI</td><td><span class="tag kept">KEPT</span></td><td>$754,804,977</td><td>$878,294,253</td><td>5.9%</td><td>46%</td><td style="color:var(--up)">+0.5%</td><td>0.01</td><td>-81.5%</td></tr>
+    <tr><td>34</td><td>BABA</td><td><span class="tag kept">KEPT</span></td><td>$751,668,031</td><td>$777,251,512</td><td>3.3%</td><td>54%</td><td style="color:var(--up)">+5.0%</td><td>0.12</td><td>-80.1%</td></tr>
+    <tr><td>35</td><td>IONQ</td><td><span class="tag kept">KEPT</span></td><td>$688,941,085</td><td>$932,599,681</td><td>8.7%</td><td>50%</td><td style="color:var(--up)">+42.4%</td><td>0.41</td><td>-90.0%</td></tr>
+    <tr><td>36</td><td>QCOM</td><td><span class="tag kept">KEPT</span></td><td>$667,573,493</td><td>$1,992,104,329</td><td>6.6%</td><td>55%</td><td style="color:var(--up)">+6.7%</td><td>0.18</td><td>-60.0%</td></tr>
+    <tr><td>37</td><td>BMNR</td><td><span class="tag removed">REMOVED</span></td><td>$623,430,264</td><td>$677,366,109</td><td>13.0%</td><td>26%</td><td style="color:var(--down)">-3.1%</td><td>-0.01</td><td>-99.7%</td></tr>
+    <tr><td>38</td><td>SMCI</td><td><span class="tag kept">KEPT</span></td><td>$554,568,027</td><td>$718,836,924</td><td>4.6%</td><td>60%</td><td style="color:var(--up)">+21.7%</td><td>0.34</td><td>-84.8%</td></tr>
+    <tr><td>39</td><td>MARA</td><td><span class="tag removed">REMOVED</span></td><td>$414,794,466</td><td>$429,207,633</td><td>11.1%</td><td>30%</td><td style="color:var(--down)">-16.2%</td><td>-0.12</td><td>-99.6%</td></tr>
+    <tr><td>40</td><td>HIMS</td><td><span class="tag kept">KEPT</span></td><td>$414,514,789</td><td>$623,431,995</td><td>6.8%</td><td>57%</td><td style="color:var(--up)">+16.8%</td><td>0.20</td><td>-87.3%</td></tr>
+    <tr><td>41</td><td>MUU</td><td><span class="tag kept">KEPT</span></td><td>$380,351,450</td><td>$431,759,486</td><td>10.1%</td><td>97%</td><td style="color:var(--up)">+5937.3%</td><td>43.59</td><td>-52.9%</td></tr>
+    <tr><td>42</td><td>NVTS</td><td><span class="tag removed">REMOVED</span></td><td>$366,947,826</td><td>$434,935,333</td><td>8.4%</td><td>41%</td><td style="color:var(--up)">+6.4%</td><td>0.05</td><td>-92.0%</td></tr>
+    <tr><td>43</td><td>QBTS</td><td><span class="tag removed">REMOVED</span></td><td>$357,795,643</td><td>$463,495,236</td><td>10.2%</td><td>38%</td><td style="color:var(--up)">+29.0%</td><td>0.21</td><td>-96.7%</td></tr>
+    <tr><td>44</td><td>RGTI</td><td><span class="tag kept">KEPT</span></td><td>$299,011,278</td><td>$392,804,948</td><td>11.6%</td><td>46%</td><td style="color:var(--up)">+137.8%</td><td>0.96</td><td>-78.8%</td></tr>
+    <tr><td>45</td><td>SMR</td><td><span class="tag kept">KEPT</span></td><td>$287,742,064</td><td>$320,190,038</td><td>9.7%</td><td>46%</td><td style="color:var(--up)">+4.0%</td><td>0.04</td><td>-82.9%</td></tr>
+    <tr><td>46</td><td>POET</td><td><span class="tag removed">REMOVED</span></td><td>$194,268,231</td><td>$349,427,779</td><td>9.1%</td><td>56%</td><td style="color:var(--up)">+57.0%</td><td>0.49</td><td>-86.3%</td></tr>
+    <tr><td>47</td><td>CLSK</td><td><span class="tag removed">REMOVED</span></td><td>$184,136,286</td><td>$189,673,562</td><td>8.7%</td><td>46%</td><td style="color:var(--down)">-3.7%</td><td>-0.01</td><td>-98.6%</td></tr>
+    <tr><td>48</td><td>BTI</td><td><span class="tag kept">KEPT</span></td><td>$132,633,019</td><td>$144,805,335</td><td>1.8%</td><td>66%</td><td style="color:var(--up)">+8.4%</td><td>0.35</td><td>-62.3%</td></tr>
+    <tr><td>49</td><td>GME</td><td><span class="tag removed">REMOVED</span></td><td>$108,520,448</td><td>$142,000,849</td><td>5.2%</td><td>45%</td><td style="color:var(--up)">+10.3%</td><td>0.12</td><td>-95.5%</td></tr>
+    <tr><td>50</td><td>QUBT</td><td><span class="tag removed">REMOVED</span></td><td>$87,606,654</td><td>$137,355,950</td><td>15.2%</td><td>24%</td><td style="color:var(--down)">-20.3%</td><td>-0.03</td><td>-100.0%</td></tr>
+    <tr><td>51</td><td>ARMK</td><td><span class="tag removed">REMOVED</span></td><td>$61,371,191</td><td>$67,969,038</td><td>2.6%</td><td>68%</td><td style="color:var(--up)">+8.4%</td><td>0.24</td><td>-72.3%</td></tr>
+    <tr><td>52</td><td>ALKS</td><td><span class="tag removed">REMOVED</span></td><td>$37,351,009</td><td>$49,466,102</td><td>4.2%</td><td>54%</td><td style="color:var(--up)">+1.5%</td><td>0.03</td><td>-87.6%</td></tr>
+    <tr><td>53</td><td>SGHC</td><td><span class="tag removed">REMOVED</span></td><td>$24,851,825</td><td>$29,538,821</td><td>5.0%</td><td>44%</td><td style="color:var(--up)">+6.3%</td><td>0.11</td><td>-78.5%</td></tr>
+    <tr><td>54</td><td>NOVT</td><td><span class="tag removed">REMOVED</span></td><td>$20,808,980</td><td>$23,426,922</td><td>3.2%</td><td>70%</td><td style="color:var(--up)">+20.2%</td><td>0.56</td><td>-46.7%</td></tr>
+    <tr><td>55</td><td>SMBS</td><td><span class="tag removed">REMOVED</span></td><td>$16,918,189</td><td>$26,404,298</td><td>0.3%</td><td>82%</td><td style="color:var(--down)">-2.0%</td><td>-0.46</td><td>-3.0%</td></tr>
+    <tr><td>56</td><td>CEVA</td><td><span class="tag kept">KEPT</span></td><td>$6,577,762</td><td>$13,414,391</td><td>4.3%</td><td>52%</td><td style="color:var(--up)">+6.9%</td><td>0.14</td><td>-78.2%</td></tr>
+    <tr><td>57</td><td>ERNA</td><td><span class="tag removed">REMOVED</span></td><td>$67,208</td><td>$15,761,039</td><td>9.8%</td><td>30%</td><td style="color:var(--down)">-36.8%</td><td>-0.30</td><td>-100.0%</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>All 57 Symbols &mdash; Ranked by Full-History Median Dollar Volume</h2>
+
+<div class="tbl-wrap">
+<table>
+  <thead>
+    <tr>
+      <th>#</th><th>Symbol</th><th>Status</th><th>Full Med DVol</th><th>Full Avg DVol</th>
+      <th>ATR%</th><th>%&gt;EMA200</th><th>Signals</th><th>Signal Density</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>SNDK</td><td><span class="tag kept">KEPT</span></td><td>$6,816,583,423</td><td>$6,713,619,366</td><td>8.3%</td><td>100%</td><td>65</td><td>0.575</td></tr>
+    <tr><td>2</td><td>AAPL</td><td><span class="tag kept">KEPT</span></td><td>$4,410,046,704</td><td>$4,972,307,933</td><td>2.7%</td><td>76%</td><td>2038</td><td>0.335</td></tr>
+    <tr><td>3</td><td>AMD</td><td><span class="tag kept">KEPT</span></td><td>$2,926,929,180</td><td>$3,658,884,460</td><td>4.6%</td><td>75%</td><td>804</td><td>0.303</td></tr>
+    <tr><td>4</td><td>META</td><td><span class="tag kept">KEPT</span></td><td>$2,804,032,530</td><td>$3,323,080,480</td><td>2.8%</td><td>80%</td><td>922</td><td>0.278</td></tr>
+    <tr><td>5</td><td>TSLA</td><td><span class="tag kept">KEPT</span></td><td>$1,963,127,205</td><td>$7,712,796,314</td><td>4.5%</td><td>66%</td><td>1059</td><td>0.279</td></tr>
+    <tr><td>6</td><td>MSFT</td><td><span class="tag kept">KEPT</span></td><td>$1,704,925,493</td><td>$2,411,677,627</td><td>8.8%</td><td>64%</td><td>1424</td><td>0.234</td></tr>
+    <tr><td>7</td><td>BABA</td><td><span class="tag kept">KEPT</span></td><td>$1,524,019,535</td><td>$1,863,489,901</td><td>3.3%</td><td>54%</td><td>579</td><td>0.212</td></tr>
+    <tr><td>8</td><td>CRWV</td><td><span class="tag kept">KEPT</span></td><td>$1,499,832,806</td><td>$1,838,456,815</td><td>8.4%</td><td>30%</td><td>17</td><td>0.205</td></tr>
+    <tr><td>9</td><td>GOOGL</td><td><span class="tag kept">KEPT</span></td><td>$1,423,575,501</td><td>$1,836,314,359</td><td>2.4%</td><td>78%</td><td>1574</td><td>0.299</td></tr>
+    <tr><td>10</td><td>BAC</td><td><span class="tag removed">REMOVED</span></td><td>$1,177,991,293</td><td>$1,363,514,742</td><td>2.8%</td><td>57%</td><td>1267</td><td>0.208</td></tr>
+    <tr><td>11</td><td>AMZN</td><td><span class="tag kept">KEPT</span></td><td>$1,102,062,000</td><td>$2,211,566,348</td><td>3.1%</td><td>75%</td><td>1812</td><td>0.298</td></tr>
+    <tr><td>12</td><td>GOOG</td><td><span class="tag kept">KEPT</span></td><td>$1,074,039,771</td><td>$1,346,749,949</td><td>2.3%</td><td>80%</td><td>857</td><td>0.301</td></tr>
+    <tr><td>13</td><td>INTC</td><td><span class="tag kept">KEPT</span></td><td>$1,009,934,287</td><td>$1,191,802,444</td><td>2.9%</td><td>54%</td><td>1313</td><td>0.216</td></tr>
+    <tr><td>14</td><td>COIN</td><td><span class="tag kept">KEPT</span></td><td>$988,878,586</td><td>$1,233,036,975</td><td>7.7%</td><td>45%</td><td>179</td><td>0.166</td></tr>
+    <tr><td>15</td><td>PLTR</td><td><span class="tag kept">KEPT</span></td><td>$932,928,456</td><td>$2,550,316,159</td><td>5.4%</td><td>63%</td><td>286</td><td>0.236</td></tr>
+    <tr><td>16</td><td>NFLX</td><td><span class="tag kept">KEPT</span></td><td>$712,610,782</td><td>$968,134,978</td><td>4.0%</td><td>70%</td><td>1866</td><td>0.320</td></tr>
+    <tr><td>17</td><td>MU</td><td><span class="tag kept">KEPT</span></td><td>$688,519,145</td><td>$1,137,771,076</td><td>4.0%</td><td>62%</td><td>1009</td><td>0.258</td></tr>
+    <tr><td>18</td><td>QCOM</td><td><span class="tag kept">KEPT</span></td><td>$557,386,903</td><td>$648,013,785</td><td>6.6%</td><td>55%</td><td>1249</td><td>0.205</td></tr>
+    <tr><td>19</td><td>ORCL</td><td><span class="tag kept">KEPT</span></td><td>$534,216,076</td><td>$705,881,336</td><td>2.6%</td><td>69%</td><td>1534</td><td>0.252</td></tr>
+    <tr><td>20</td><td>AVGO</td><td><span class="tag kept">KEPT</span></td><td>$527,331,993</td><td>$1,212,868,796</td><td>3.0%</td><td>85%</td><td>662</td><td>0.278</td></tr>
+    <tr><td>21</td><td>SOFI</td><td><span class="tag kept">KEPT</span></td><td>$370,790,853</td><td>$554,893,890</td><td>5.9%</td><td>46%</td><td>222</td><td>0.190</td></tr>
+    <tr><td>22</td><td>NVDA</td><td><span class="tag kept">KEPT</span></td><td>$327,691,000</td><td>$3,811,410,748</td><td>4.2%</td><td>68%</td><td>1752</td><td>0.288</td></tr>
+    <tr><td>23</td><td>BKNG</td><td><span class="tag kept">KEPT</span></td><td>$239,990,680</td><td>$300,807,734</td><td>3.4%</td><td>72%</td><td>1872</td><td>0.308</td></tr>
+    <tr><td>24</td><td>TSM</td><td><span class="tag kept">KEPT</span></td><td>$181,165,611</td><td>$424,871,013</td><td>2.8%</td><td>69%</td><td>1505</td><td>0.248</td></tr>
+    <tr><td>25</td><td>MRVL</td><td><span class="tag removed">REMOVED</span></td><td>$157,229,206</td><td>$245,283,494</td><td>9.2%</td><td>60%</td><td>1331</td><td>0.219</td></tr>
+    <tr><td>26</td><td>GLW</td><td><span class="tag kept">KEPT</span></td><td>$144,517,694</td><td>$185,300,806</td><td>3.2%</td><td>61%</td><td>1569</td><td>0.258</td></tr>
+    <tr><td>27</td><td>NOK</td><td><span class="tag removed">REMOVED</span></td><td>$127,381,776</td><td>$172,015,435</td><td>3.0%</td><td>46%</td><td>1102</td><td>0.181</td></tr>
+    <tr><td>28</td><td>STX</td><td><span class="tag kept">KEPT</span></td><td>$125,364,861</td><td>$170,724,130</td><td>3.7%</td><td>64%</td><td>1338</td><td>0.247</td></tr>
+    <tr><td>29</td><td>MUU</td><td><span class="tag kept">KEPT</span></td><td>$92,450,236</td><td>$166,494,298</td><td>10.1%</td><td>97%</td><td>100</td><td>0.505</td></tr>
+    <tr><td>30</td><td>ASML</td><td><span class="tag kept">KEPT</span></td><td>$75,052,794</td><td>$156,996,636</td><td>2.9%</td><td>71%</td><td>1676</td><td>0.275</td></tr>
+    <tr><td>31</td><td>IONQ</td><td><span class="tag kept">KEPT</span></td><td>$74,612,895</td><td>$275,263,003</td><td>8.7%</td><td>50%</td><td>281</td><td>0.245</td></tr>
+    <tr><td>32</td><td>IREN</td><td><span class="tag kept">KEPT</span></td><td>$73,651,108</td><td>$324,088,856</td><td>10.6%</td><td>59%</td><td>227</td><td>0.245</td></tr>
+    <tr><td>33</td><td>SMR</td><td><span class="tag kept">KEPT</span></td><td>$67,015,364</td><td>$162,171,046</td><td>9.7%</td><td>46%</td><td>167</td><td>0.206</td></tr>
+    <tr><td>34</td><td>GME</td><td><span class="tag removed">REMOVED</span></td><td>$63,210,271</td><td>$143,270,278</td><td>5.2%</td><td>45%</td><td>1165</td><td>0.197</td></tr>
+    <tr><td>35</td><td>MARA</td><td><span class="tag removed">REMOVED</span></td><td>$54,778,265</td><td>$268,239,049</td><td>11.1%</td><td>30%</td><td>331</td><td>0.120</td></tr>
+    <tr><td>36</td><td>LITE</td><td><span class="tag kept">KEPT</span></td><td>$53,987,802</td><td>$155,377,948</td><td>4.4%</td><td>64%</td><td>757</td><td>0.301</td></tr>
+    <tr><td>37</td><td>ARMK</td><td><span class="tag removed">REMOVED</span></td><td>$40,968,708</td><td>$50,015,444</td><td>2.6%</td><td>68%</td><td>763</td><td>0.261</td></tr>
+    <tr><td>38</td><td>RKLB</td><td><span class="tag kept">KEPT</span></td><td>$29,660,178</td><td>$264,038,652</td><td>7.0%</td><td>54%</td><td>320</td><td>0.272</td></tr>
+    <tr><td>39</td><td>HIMS</td><td><span class="tag kept">KEPT</span></td><td>$19,830,280</td><td>$261,533,360</td><td>6.8%</td><td>57%</td><td>399</td><td>0.270</td></tr>
+    <tr><td>40</td><td>BTI</td><td><span class="tag kept">KEPT</span></td><td>$19,028,310</td><td>$50,441,022</td><td>1.8%</td><td>66%</td><td>1227</td><td>0.202</td></tr>
+    <tr><td>41</td><td>ALKS</td><td><span class="tag removed">REMOVED</span></td><td>$17,833,901</td><td>$23,785,591</td><td>4.2%</td><td>54%</td><td>1427</td><td>0.235</td></tr>
+    <tr><td>42</td><td>MSTR</td><td><span class="tag kept">KEPT</span></td><td>$14,225,680</td><td>$268,228,011</td><td>6.7%</td><td>59%</td><td>1481</td><td>0.243</td></tr>
+    <tr><td>43</td><td>RGTI</td><td><span class="tag kept">KEPT</span></td><td>$12,504,283</td><td>$409,194,930</td><td>11.6%</td><td>46%</td><td>168</td><td>0.197</td></tr>
+    <tr><td>44</td><td>SMBS</td><td><span class="tag removed">REMOVED</span></td><td>$11,863,388</td><td>$15,051,773</td><td>0.3%</td><td>82%</td><td>29</td><td>0.171</td></tr>
+    <tr><td>45</td><td>ASTS</td><td><span class="tag kept">KEPT</span></td><td>$11,820,976</td><td>$163,006,670</td><td>8.4%</td><td>55%</td><td>395</td><td>0.274</td></tr>
+    <tr><td>46</td><td>NVTS</td><td><span class="tag removed">REMOVED</span></td><td>$9,409,263</td><td>$67,849,323</td><td>8.4%</td><td>41%</td><td>212</td><td>0.187</td></tr>
+    <tr><td>47</td><td>AAOI</td><td><span class="tag kept">KEPT</span></td><td>$7,162,140</td><td>$49,758,494</td><td>7.1%</td><td>42%</td><td>643</td><td>0.216</td></tr>
+    <tr><td>48</td><td>CLSK</td><td><span class="tag removed">REMOVED</span></td><td>$6,069,026</td><td>$78,116,331</td><td>8.7%</td><td>46%</td><td>572</td><td>0.205</td></tr>
+    <tr><td>49</td><td>SMCI</td><td><span class="tag kept">KEPT</span></td><td>$5,326,291</td><td>$293,281,829</td><td>4.6%</td><td>60%</td><td>1105</td><td>0.240</td></tr>
+    <tr><td>50</td><td>NOVT</td><td><span class="tag removed">REMOVED</span></td><td>$4,514,626</td><td>$6,858,689</td><td>3.2%</td><td>70%</td><td>798</td><td>0.220</td></tr>
+    <tr><td>51</td><td>QBTS</td><td><span class="tag removed">REMOVED</span></td><td>$3,399,180</td><td>$223,477,412</td><td>10.2%</td><td>38%</td><td>191</td><td>0.165</td></tr>
+    <tr><td>52</td><td>POET</td><td><span class="tag removed">REMOVED</span></td><td>$1,991,120</td><td>$24,027,455</td><td>9.1%</td><td>56%</td><td>212</td><td>0.248</td></tr>
+    <tr><td>53</td><td>CEVA</td><td><span class="tag kept">KEPT</span></td><td>$1,517,941</td><td>$2,463,242</td><td>4.3%</td><td>52%</td><td>1249</td><td>0.218</td></tr>
+    <tr><td>54</td><td>SGHC</td><td><span class="tag removed">REMOVED</span></td><td>$1,373,224</td><td>$6,210,759</td><td>5.0%</td><td>44%</td><td>247</td><td>0.211</td></tr>
+    <tr><td>55</td><td>ERNA</td><td><span class="tag removed">REMOVED</span></td><td>$35,378</td><td>$2,682,891</td><td>9.8%</td><td>30%</td><td>933</td><td>0.154</td></tr>
+    <tr><td>56</td><td>QUBT</td><td><span class="tag removed">REMOVED</span></td><td>$3,404</td><td>$28,907,200</td><td>15.2%</td><td>24%</td><td>496</td><td>0.126</td></tr>
+    <tr><td>57</td><td>BMNR</td><td><span class="tag removed">REMOVED</span></td><td>$0</td><td>$89,072,239</td><td>13.0%</td><td>26%</td><td>455</td><td>0.144</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Edge Cases: Kept Symbols That Fail Filters</h2>
+
+<div class="compare-grid">
+  <div class="card">
+    <h3>Full Median Dollar Vol &lt; $10M</h3>
+    <table>
+      <thead><tr><th style="text-align:left">Symbol</th><th>Med DVol</th><th>Sharpe</th><th>%EMA200</th><th>Ann. Ret</th></tr></thead>
+      <tbody>
+        <tr><td style="text-align:left">CEVA</td><td>$1,517,941</td><td>0.14</td><td>52%</td><td style="color:var(--up)">+6.9%</td></tr>
+        <tr><td style="text-align:left">SMCI</td><td>$5,326,291</td><td>0.34</td><td>60%</td><td style="color:var(--up)">+21.7%</td></tr>
+        <tr><td style="text-align:left">AAOI</td><td>$7,162,140</td><td>0.21</td><td>42%</td><td style="color:var(--up)">+19.1%</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:0.75rem; color:var(--muted); margin-top:8px;">
+      SMCI and AAOI have surging recent volume; CEVA is genuinely low-liquidity.
+    </p>
+  </div>
+
+  <div class="card">
+    <h3>% Above EMA(200) &lt; 50%</h3>
+    <table>
+      <thead><tr><th style="text-align:left">Symbol</th><th>%EMA200</th><th>Med DVol</th><th>Sharpe</th><th>Ann. Ret</th></tr></thead>
+      <tbody>
+        <tr><td style="text-align:left">CRWV</td><td>30%</td><td>$1,499,832,806</td><td>0.74</td><td style="color:var(--up)">+73.4%</td></tr>
+        <tr><td style="text-align:left">AAOI</td><td>42%</td><td>$7,162,140</td><td>0.21</td><td style="color:var(--up)">+19.1%</td></tr>
+        <tr><td style="text-align:left">COIN</td><td>45%</td><td>$988,878,586</td><td>0.04</td><td style="color:var(--up)">+3.2%</td></tr>
+        <tr><td style="text-align:left">RGTI</td><td>46%</td><td>$12,504,283</td><td>0.96</td><td style="color:var(--up)">+137.8%</td></tr>
+        <tr><td style="text-align:left">SOFI</td><td>46%</td><td>$370,790,853</td><td>0.01</td><td style="color:var(--up)">+0.5%</td></tr>
+        <tr><td style="text-align:left">SMR</td><td>46%</td><td>$67,015,364</td><td>0.04</td><td style="color:var(--up)">+4.0%</td></tr>
+        <tr><td style="text-align:left">IONQ</td><td>50%</td><td>$74,612,895</td><td>0.41</td><td style="color:var(--up)">+42.4%</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:0.75rem; color:var(--muted); margin-top:8px;">
+      Mostly newer IPOs (CRWV, RGTI, SMR) or crypto-adjacent (COIN). Consider manual whitelisting.
+    </p>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:24px;">
+  <h3>Kept Symbols with Raw Sharpe &lt; 0</h3>
+  <p style="color:var(--up); font-weight:600; margin-top:8px;">None &mdash; all 40 kept symbols have non-negative Sharpe ratios.</p>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<h2>Blacklisted Symbols (17 Removed)</h2>
+
+<div class="card" style="margin-bottom:24px;">
+<table>
+  <thead>
+    <tr><th style="text-align:left">Symbol</th><th>Reason Category</th><th>Ann. Return</th><th>Sharpe</th><th>Max DD</th><th>Full Med DVol</th></tr>
+  </thead>
+  <tbody>
+    <tr><td style="text-align:left">ERNA</td><td style="text-align:left">Delisted / near-zero liquidity</td><td style="color:var(--down)">-36.8%</td><td>-0.30</td><td>-100.0%</td><td>$35,378</td></tr>
+    <tr><td style="text-align:left">QUBT</td><td style="text-align:left">Speculative penny stock, -100% DD</td><td style="color:var(--down)">-20.3%</td><td>-0.03</td><td>-100.0%</td><td>$3,404</td></tr>
+    <tr><td style="text-align:left">BMNR</td><td style="text-align:left">Zero median volume, -99.7% DD</td><td style="color:var(--down)">-3.1%</td><td>-0.01</td><td>-99.7%</td><td>$0</td></tr>
+    <tr><td style="text-align:left">MARA</td><td style="text-align:left">Crypto miner, extreme volatility</td><td style="color:var(--down)">-16.2%</td><td>-0.12</td><td>-99.6%</td><td>$54,778,265</td></tr>
+    <tr><td style="text-align:left">CLSK</td><td style="text-align:left">Crypto miner, negative returns</td><td style="color:var(--down)">-3.7%</td><td>-0.01</td><td>-98.6%</td><td>$6,069,026</td></tr>
+    <tr><td style="text-align:left">BAC</td><td style="text-align:left">Bank, not tech momentum</td><td style="color:var(--down)">-1.2%</td><td>-0.03</td><td>-96.5%</td><td>$1,177,991,293</td></tr>
+    <tr><td style="text-align:left">QBTS</td><td style="text-align:left">Speculative quantum, -96.7% DD</td><td style="color:var(--up)">+29.0%</td><td>0.21</td><td>-96.7%</td><td>$3,399,180</td></tr>
+    <tr><td style="text-align:left">NOK</td><td style="text-align:left">Non-tech, negative returns</td><td style="color:var(--down)">-2.2%</td><td>-0.05</td><td>-95.9%</td><td>$127,381,776</td></tr>
+    <tr><td style="text-align:left">GME</td><td style="text-align:left">Meme stock, extreme DD</td><td style="color:var(--up)">+10.3%</td><td>0.12</td><td>-95.5%</td><td>$63,210,271</td></tr>
+    <tr><td style="text-align:left">NVTS</td><td style="text-align:left">Low liquidity, weak returns</td><td style="color:var(--up)">+6.4%</td><td>0.05</td><td>-92.0%</td><td>$9,409,263</td></tr>
+    <tr><td style="text-align:left">ALKS</td><td style="text-align:left">Biotech, low liquidity</td><td style="color:var(--up)">+1.5%</td><td>0.03</td><td>-87.6%</td><td>$17,833,901</td></tr>
+    <tr><td style="text-align:left">MRVL</td><td style="text-align:left">High ATR% (9.2%), deep DD</td><td style="color:var(--up)">+12.2%</td><td>0.25</td><td>-86.5%</td><td>$157,229,206</td></tr>
+    <tr><td style="text-align:left">POET</td><td style="text-align:left">Low full-history liquidity</td><td style="color:var(--up)">+57.0%</td><td>0.49</td><td>-86.3%</td><td>$1,991,120</td></tr>
+    <tr><td style="text-align:left">SGHC</td><td style="text-align:left">Low liquidity, weak Sharpe</td><td style="color:var(--up)">+6.3%</td><td>0.11</td><td>-78.5%</td><td>$1,373,224</td></tr>
+    <tr><td style="text-align:left">ARMK</td><td style="text-align:left">Non-tech, low liquidity</td><td style="color:var(--up)">+8.4%</td><td>0.24</td><td>-72.3%</td><td>$40,968,708</td></tr>
+    <tr><td style="text-align:left">NOVT</td><td style="text-align:left">Low liquidity despite good Sharpe</td><td style="color:var(--up)">+20.2%</td><td>0.56</td><td>-46.7%</td><td>$4,514,626</td></tr>
+    <tr><td style="text-align:left">SMBS</td><td style="text-align:left">Minimal data, negative returns</td><td style="color:var(--down)">-2.0%</td><td>-0.46</td><td>-3.0%</td><td>$11,863,388</td></tr>
+  </tbody>
+</table>
+</div>
+
+<footer>
+  Stock Selection Analysis &mdash; Generated 2026-05-13
+  &mdash; Data source: analyze_selection.py against 57 non-ETF symbols
+</footer>
+
+</body>
+</html>
