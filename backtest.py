@@ -5,9 +5,9 @@ Multi-Symbol Backtest: UT Bot + HMA/EMA Strategy with Staged Exits
 
 Strategy:
   - Indicators: UT Bot (ATR 10, K=2.5), HMA(100), EMA(200) via pandas-ta
-  - Entry:  UT Bot Buy SIGNAL  AND  Close > HMA(100)  AND  Close > EMA(200)
-            → execute at NEXT day's open price
-            Position size = 5% of initial capital (max 20 concurrent positions)
+  - Entry:  UT Bot Buy ENV  AND  Close > HMA(100)  AND  Close > EMA(200)
+            AND  ADX(14) > 20  → execute at NEXT day's open price
+            Position size = 5% of current equity (compounding, max 20 concurrent)
   - Exit (staged profit-taking):
             +5%  → sell 30% of initial shares
             +10% → sell 50% of initial shares
@@ -18,6 +18,7 @@ Usage:
     uv run backtest.py
 """
 
+import os
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
@@ -60,6 +61,28 @@ ETF_SYMBOLS = {
     "SMH", "SOXL", "SOXX", "SPY", "SQQQ", "TLT",
     "TQQQ", "TSLL",
 }
+
+# Blacklisted Symbols
+BLACKLIST_SYMBOLS = {
+    "BMNR", "BAC", "CLSK", "ERNA", "GME", "MRVL", "QBTS", "QUBT", "POET", "SGHC"
+}
+
+# ── File-ownership helper (when running under sudo) ──────────────────────────
+_SUDO_UID = int(os.environ.get("SUDO_UID", -1))
+_SUDO_GID = int(os.environ.get("SUDO_GID", -1))
+
+def _fix_owner(path: Path) -> None:
+    """chown *path* (and its parent dir) back to the real user when running via sudo."""
+    if _SUDO_UID < 0:
+        return
+    try:
+        os.chown(path, _SUDO_UID, _SUDO_GID)
+        # Also fix the parent directory if we created it
+        parent = path.parent
+        if parent != Path(".") and parent.exists():
+            os.chown(parent, _SUDO_UID, _SUDO_GID)
+    except OSError:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -117,12 +140,15 @@ def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
     all_data: dict[str, pd.DataFrame] = {}
     csv_files = sorted(DATA_DIR.glob("*_25Y_daily.csv"))
     print(f"[data] Found {len(csv_files)} CSV files in {DATA_DIR}/")
-    skipped_etfs: list[str] = []
+    skipped_symbols: list[str] = []
 
     for f in csv_files:
         symbol = f.stem.replace("_25Y_daily", "")
         if exclude_etfs and symbol in ETF_SYMBOLS:
-            skipped_etfs.append(symbol)
+            skipped_symbols.append(symbol)
+            continue
+        if symbol in BLACKLIST_SYMBOLS:
+            skipped_symbols.append(symbol)
             continue
         df = pd.read_csv(f, parse_dates=["date"], index_col="date")
         df = df.sort_index()
@@ -157,6 +183,7 @@ def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
             & (df["close"] > df["hma"])
             & (df["close"] > df["ema200"])
             & (df["adx"] > 20)
+            & (df["hma"] > df["ema200"])
         )
         df["stop_hit"] = (
             (df["close"] < df["hma"])
@@ -165,8 +192,7 @@ def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
         )
         all_data[symbol] = df
 
-    if skipped_etfs:
-        print(f"[data] Excluded {len(skipped_etfs)} ETFs: {', '.join(skipped_etfs)}")
+    print(f"[data] Excluded {len(skipped_symbols)} symbols: {', '.join(skipped_symbols)}")
     print(f"[data] {len(all_data)} stocks ready after indicator warm-up")
     return all_data
 
@@ -212,7 +238,6 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
 
     cash = INITIAL_CAPITAL
     positions: dict[str, Position] = {}
-    alloc_amount = INITIAL_CAPITAL * POSITION_PCT
 
     equity_records: list[dict] = []
     trade_log: list[dict] = []
@@ -224,6 +249,20 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
         closed_today: set[str] = set()
 
         # ── Phase 0: Execute pending entries at today's OPEN ──────────────
+        # Compounding: compute current equity at today's open and size each
+        # position as POSITION_PCT of that equity.
+        if pending_entries:
+            pos_value_open = sum(
+                pos.remaining_shares * (
+                    all_data[s].loc[date, "open"]
+                    if date in all_data[s].index
+                    else pos.entry_price
+                )
+                for s, pos in positions.items()
+            )
+            current_equity = cash + pos_value_open
+            alloc_amount = current_equity * POSITION_PCT
+
         for sym in sorted(pending_entries):
             if sym in positions:
                 continue
@@ -1160,6 +1199,7 @@ def generate_single_report(symbol: str, df: pd.DataFrame,
     )
     out = REPORTS_DIR / f"{symbol}_report.html"
     out.write_text(html, encoding="utf-8")
+    _fix_owner(out)
     return out
 
 
@@ -1269,7 +1309,7 @@ HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 <h3>Strategy Rules</h3>
 <ul>
   <li><b>Indicators:</b> UT Bot (ATR {{ atr_period }}, K={{ ut_k }}), HMA({{ hma_len }}), EMA({{ ema_len }})</li>
-  <li><b>Entry:</b> UT Bot <em>Buy signal</em> (crossover) AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) &rarr; buy at <b>next day's open</b> &mdash; allocate {{ pos_pct }}% of initial capital per position (max 20 concurrent)</li>
+  <li><b>Entry:</b> UT Bot <em>Buy environment</em> AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) AND ADX(14) &gt; 20 &rarr; buy at <b>next day's open</b> &mdash; allocate {{ pos_pct }}% of <b>current equity</b> per position (compounding, max 20 concurrent)</li>
   <li><b>Exit (staged):</b> +5% &rarr; sell 30%, +10% &rarr; sell 50%, +20% &rarr; sell all remaining</li>
   <li><b>Stop-loss:</b> Close &lt; HMA({{ hma_len }}) OR Close &lt; EMA({{ ema_len }}) OR UT Bot enters <em>Sell</em> environment</li>
 </ul>
@@ -1455,7 +1495,9 @@ def generate_report(equity_df, trade_df, round_trips, stats, per_sym, all_data,
     )
     tpl_vars.update(stats)  # stats includes initial_capital, start_date, etc.
     html = HTML_TEMPLATE.render(**tpl_vars)
-    Path(OUTPUT_FILE).write_text(html, encoding="utf-8")
+    out_path = Path(OUTPUT_FILE)
+    out_path.write_text(html, encoding="utf-8")
+    _fix_owner(out_path)
     print(f"[report] Written to {OUTPUT_FILE} ({len(html)/1024:.0f} KB)")
 
 
@@ -1474,6 +1516,7 @@ def main():
     # A) Per-Symbol Full-Position Backtests
     # ══════════════════════════════════════════════════════════
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    _fix_owner(REPORTS_DIR)
     print(f"\n{'─'*60}")
     print(f"  Per-symbol full-position backtests → {REPORTS_DIR}/")
     print(f"{'─'*60}")
