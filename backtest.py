@@ -5,13 +5,12 @@ Multi-Symbol Backtest: UT Bot + HMA/EMA Strategy with Staged Exits
 
 Strategy:
   - Indicators: UT Bot (ATR 10, K=2.5), HMA(100), EMA(200) via pandas-ta
-  - Entry:  UT Bot Buy ENV  AND  Close > HMA(100)  AND  Close > EMA(200)
-            AND  ADX(14) > 20  → execute at NEXT day's open price
+  - Entry:  UT Bot Buy ENV (≥2 days)  AND  Close > HMA(100)  AND  Close > EMA(200)
+            AND  ADX(14) > 20  AND  Volume > 20d SMA
+            → execute at NEXT day's open price
             Position size = 5% of current equity (compounding, max 20 concurrent)
-  - Exit (staged profit-taking):
-            +5%  → sell 30% of initial shares
-            +10% → sell 50% of initial shares
-            +20% → sell all remaining
+            Cooldown: 3 days after stop-out before re-entering same symbol
+  - Exit:   +20% → sell all  |  breakeven stop (once +10%, stop at entry price)
   - Stop-loss: Close < HMA(100)  OR  Close < EMA(200)  OR  UT Bot Sell env
 
 Usage:
@@ -46,10 +45,14 @@ UT_K = 2.5
 HMA_LENGTH = 100
 EMA_LENGTH = 200
 
-# Staged profit-taking
-TP1_PCT = 0.05;  TP1_EXIT = 0.30   # +5 % → sell 30 %
-TP2_PCT = 0.10;  TP2_EXIT = 0.50   # +10 % → sell 50 %
-TP3_PCT = 0.20                      # +20 % → sell all remaining
+# Profit-taking & breakeven stop
+TP_PCT = 0.20                       # +20 % → sell all
+BE_TRIGGER_PCT = 0.10               # once pnl ≥ +10 %, activate breakeven stop
+BE_STOP_PCT = 0.0                   # breakeven stop at entry price (0 % profit)
+
+# Entry filters
+COOLDOWN_DAYS = 3                   # days to wait after stop-out before re-entering same symbol
+BUY_ENV_MIN_DAYS = 2                # buy environment must persist ≥ N days before entry
 
 REPORTS_DIR = Path("reports")       # per-symbol reports
 
@@ -175,15 +178,28 @@ def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
         if len(df) < 50:
             continue
 
+        # Buy environment duration: consecutive days in buy env
+        buy_streak = df["ut_buy"].astype(int)
+        buy_streak = buy_streak.groupby(
+            (~df["ut_buy"]).cumsum()
+        ).cumsum()
+        df["buy_env_days"] = buy_streak
+
+        # Volume filter: today's volume > 20-day SMA of volume
+        df["vol_sma20"] = df["volume"].rolling(20).mean()
+        df["vol_above_avg"] = df["volume"] > df["vol_sma20"]
+
         # Pre-computed signals
-        # Entry: UT Bot buy environment + close > HMA + close > EMA + ADX > 20
+        # Entry: UT Bot buy env ≥ N days + close > HMA + close > EMA
+        #        + ADX > 20 + volume above 20d avg
         # (actual buy happens at NEXT day's open)
         df["entry_ok"] = (
             df["ut_buy"]
+            & (df["buy_env_days"] >= BUY_ENV_MIN_DAYS)
             & (df["close"] > df["hma"])
             & (df["close"] > df["ema200"])
             & (df["adx"] > 20)
-            & (df["hma"] > df["ema200"])
+            & df["vol_above_avg"]
         )
         df["stop_hit"] = (
             (df["close"] < df["hma"])
@@ -204,7 +220,7 @@ class Position:
     __slots__ = (
         "symbol", "entry_price", "entry_date",
         "initial_shares", "remaining_shares",
-        "took_tp1", "took_tp2",
+        "breakeven_active",
     )
 
     def __init__(self, symbol, entry_price, entry_date, shares):
@@ -213,8 +229,7 @@ class Position:
         self.entry_date = entry_date
         self.initial_shares = shares
         self.remaining_shares = shares
-        self.took_tp1 = False
-        self.took_tp2 = False
+        self.breakeven_active = False      # set True once pnl ≥ BE_TRIGGER_PCT
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -244,6 +259,8 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
 
     # Pending entries: signals that fired yesterday, to be filled at today's open
     pending_entries: set[str] = set()
+    # Cooldown tracker: sym → earliest date allowed to re-enter
+    cooldown_until: dict[str, pd.Timestamp] = {}
 
     for date in all_dates:
         closed_today: set[str] = set()
@@ -302,7 +319,28 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
             price = row["close"]
             pnl_pct = (price - pos.entry_price) / pos.entry_price
 
-            # Stop-loss (overrides profit-taking)
+            # Activate breakeven stop once profit ≥ trigger
+            if not pos.breakeven_active and pnl_pct >= BE_TRIGGER_PCT:
+                pos.breakeven_active = True
+
+            # ─ Breakeven stop: once activated, if price drops back to entry → exit
+            if pos.breakeven_active and pnl_pct <= BE_STOP_PCT:
+                sell_n = pos.remaining_shares
+                if sell_n > 0:
+                    cash += sell_n * price
+                    trade_log.append(dict(
+                        symbol=sym, date=date, side="SELL",
+                        shares=sell_n, price=price,
+                        reason="BE_STOP", pnl_pct=pnl_pct,
+                        entry_price=pos.entry_price, entry_date=pos.entry_date,
+                    ))
+                    pos.remaining_shares = 0
+                to_remove.append(sym)
+                closed_today.add(sym)
+                cooldown_until[sym] = date + pd.Timedelta(days=COOLDOWN_DAYS)
+                continue
+
+            # ─ Normal stop-loss
             if row["stop_hit"]:
                 sell_n = pos.remaining_shares
                 if sell_n > 0:
@@ -316,58 +354,23 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
                     pos.remaining_shares = 0
                 to_remove.append(sym)
                 closed_today.add(sym)
+                cooldown_until[sym] = date + pd.Timedelta(days=COOLDOWN_DAYS)
                 continue
 
-            # Profit-taking (check from highest level down)
-            if pnl_pct >= TP3_PCT:
+            # ─ Take profit: +20 % → sell all
+            if pnl_pct >= TP_PCT:
                 sell_n = pos.remaining_shares
                 if sell_n > 0:
                     cash += sell_n * price
                     trade_log.append(dict(
                         symbol=sym, date=date, side="SELL",
                         shares=sell_n, price=price,
-                        reason="TP3_20%", pnl_pct=pnl_pct,
+                        reason="TP_20%", pnl_pct=pnl_pct,
                         entry_price=pos.entry_price, entry_date=pos.entry_date,
                     ))
                     pos.remaining_shares = 0
                 to_remove.append(sym)
                 closed_today.add(sym)
-
-            elif pnl_pct >= TP2_PCT and not pos.took_tp2:
-                sell_n = max(1, int(pos.initial_shares * TP2_EXIT))
-                sell_n = min(sell_n, pos.remaining_shares)
-                if sell_n > 0:
-                    cash += sell_n * price
-                    pos.remaining_shares -= sell_n
-                    trade_log.append(dict(
-                        symbol=sym, date=date, side="SELL",
-                        shares=sell_n, price=price,
-                        reason="TP2_10%", pnl_pct=pnl_pct,
-                        entry_price=pos.entry_price, entry_date=pos.entry_date,
-                    ))
-                pos.took_tp2 = True
-                if not pos.took_tp1:
-                    pos.took_tp1 = True
-                if pos.remaining_shares <= 0:
-                    to_remove.append(sym)
-                    closed_today.add(sym)
-
-            elif pnl_pct >= TP1_PCT and not pos.took_tp1:
-                sell_n = max(1, int(pos.initial_shares * TP1_EXIT))
-                sell_n = min(sell_n, pos.remaining_shares)
-                if sell_n > 0:
-                    cash += sell_n * price
-                    pos.remaining_shares -= sell_n
-                    trade_log.append(dict(
-                        symbol=sym, date=date, side="SELL",
-                        shares=sell_n, price=price,
-                        reason="TP1_5%", pnl_pct=pnl_pct,
-                        entry_price=pos.entry_price, entry_date=pos.entry_date,
-                    ))
-                pos.took_tp1 = True
-                if pos.remaining_shares <= 0:
-                    to_remove.append(sym)
-                    closed_today.add(sym)
 
         for sym in to_remove:
             positions.pop(sym, None)
@@ -375,6 +378,9 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
         # ── Phase 2: Generate entry SIGNALS at close (fill tomorrow) ──────
         for sym in sorted(all_data.keys()):
             if sym in positions or sym in closed_today:
+                continue
+            # Cooldown check
+            if sym in cooldown_until and date < cooldown_until[sym]:
                 continue
             df = all_data[sym]
             if date not in df.index:
@@ -621,6 +627,7 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
     cash = initial_capital
     pos: Position | None = None
     pending = False        # signal fired at close, buy at next open
+    cooldown_end: pd.Timestamp | None = None  # cooldown after stop-out
 
     equity_records: list[dict] = []
     trade_log: list[dict] = []
@@ -649,8 +656,26 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
             pnl_pct = (close_price - pos.entry_price) / pos.entry_price
             closed = False
 
+            # Activate breakeven stop
+            if not pos.breakeven_active and pnl_pct >= BE_TRIGGER_PCT:
+                pos.breakeven_active = True
+
+            # Breakeven stop
+            if pos.breakeven_active and pnl_pct <= BE_STOP_PCT:
+                sell_n = pos.remaining_shares
+                cash += sell_n * close_price
+                trade_log.append(dict(
+                    symbol=symbol, date=date, side="SELL",
+                    shares=sell_n, price=close_price,
+                    reason="BE_STOP", pnl_pct=pnl_pct,
+                    entry_price=pos.entry_price, entry_date=pos.entry_date,
+                ))
+                pos.remaining_shares = 0
+                closed = True
+                cooldown_end = date + pd.Timedelta(days=COOLDOWN_DAYS)
+
             # Stop-loss
-            if df.loc[date, "stop_hit"]:
+            elif df.loc[date, "stop_hit"]:
                 sell_n = pos.remaining_shares
                 cash += sell_n * close_price
                 trade_log.append(dict(
@@ -661,53 +686,20 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
                 ))
                 pos.remaining_shares = 0
                 closed = True
+                cooldown_end = date + pd.Timedelta(days=COOLDOWN_DAYS)
 
-            # Profit-taking (highest first)
-            elif pnl_pct >= TP3_PCT:
+            # Take profit: +20 % → sell all
+            elif pnl_pct >= TP_PCT:
                 sell_n = pos.remaining_shares
                 cash += sell_n * close_price
                 trade_log.append(dict(
                     symbol=symbol, date=date, side="SELL",
                     shares=sell_n, price=close_price,
-                    reason="TP3_20%", pnl_pct=pnl_pct,
+                    reason="TP_20%", pnl_pct=pnl_pct,
                     entry_price=pos.entry_price, entry_date=pos.entry_date,
                 ))
                 pos.remaining_shares = 0
                 closed = True
-
-            elif pnl_pct >= TP2_PCT and not pos.took_tp2:
-                sell_n = max(1, int(pos.initial_shares * TP2_EXIT))
-                sell_n = min(sell_n, pos.remaining_shares)
-                if sell_n > 0:
-                    cash += sell_n * close_price
-                    pos.remaining_shares -= sell_n
-                    trade_log.append(dict(
-                        symbol=symbol, date=date, side="SELL",
-                        shares=sell_n, price=close_price,
-                        reason="TP2_10%", pnl_pct=pnl_pct,
-                        entry_price=pos.entry_price, entry_date=pos.entry_date,
-                    ))
-                pos.took_tp2 = True
-                if not pos.took_tp1:
-                    pos.took_tp1 = True
-                if pos.remaining_shares <= 0:
-                    closed = True
-
-            elif pnl_pct >= TP1_PCT and not pos.took_tp1:
-                sell_n = max(1, int(pos.initial_shares * TP1_EXIT))
-                sell_n = min(sell_n, pos.remaining_shares)
-                if sell_n > 0:
-                    cash += sell_n * close_price
-                    pos.remaining_shares -= sell_n
-                    trade_log.append(dict(
-                        symbol=symbol, date=date, side="SELL",
-                        shares=sell_n, price=close_price,
-                        reason="TP1_5%", pnl_pct=pnl_pct,
-                        entry_price=pos.entry_price, entry_date=pos.entry_date,
-                    ))
-                pos.took_tp1 = True
-                if pos.remaining_shares <= 0:
-                    closed = True
 
             if closed:
                 pos = None
@@ -715,7 +707,9 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
         # ── Phase 2: Generate entry signal at close ───────────────────────
         pending = False
         if pos is None and df.loc[date, "entry_ok"]:
-            pending = True
+            # Respect cooldown
+            if cooldown_end is None or date >= cooldown_end:
+                pending = True
 
         # ── Phase 3: Record equity ────────────────────────────────────────
         held_value = (pos.remaining_shares * close_price) if pos else 0.0
@@ -1309,8 +1303,8 @@ HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 <h3>Strategy Rules</h3>
 <ul>
   <li><b>Indicators:</b> UT Bot (ATR {{ atr_period }}, K={{ ut_k }}), HMA({{ hma_len }}), EMA({{ ema_len }})</li>
-  <li><b>Entry:</b> UT Bot <em>Buy environment</em> AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) AND ADX(14) &gt; 20 &rarr; buy at <b>next day's open</b> &mdash; allocate {{ pos_pct }}% of <b>current equity</b> per position (compounding, max 20 concurrent)</li>
-  <li><b>Exit (staged):</b> +5% &rarr; sell 30%, +10% &rarr; sell 50%, +20% &rarr; sell all remaining</li>
+  <li><b>Entry:</b> UT Bot <em>Buy environment (&ge;2 days)</em> AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) AND ADX(14) &gt; 20 AND Volume &gt; 20d SMA &rarr; buy at <b>next day's open</b> &mdash; allocate {{ pos_pct }}% of <b>current equity</b> per position (compounding, max 20 concurrent). <b>Cooldown:</b> 3 days after stop-out before re-entering same symbol.</li>
+  <li><b>Take profit:</b> +20% &rarr; sell all. <b>Breakeven stop:</b> once profit &ge; +10%, stop-loss moves to entry price (保本止损).</li>
   <li><b>Stop-loss:</b> Close &lt; HMA({{ hma_len }}) OR Close &lt; EMA({{ ema_len }}) OR UT Bot enters <em>Sell</em> environment</li>
 </ul>
 <p style="margin-top:8px;color:var(--muted);">Data: {{ n_symbols }} symbols, {{ start_date }} &rarr; {{ end_date }} ({{ total_years|round(1) }} years). Initial capital ${{ "{:,.0f}".format(initial_capital) }}.</p>
