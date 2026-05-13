@@ -4,16 +4,16 @@ Multi-Symbol Backtest: UT Bot + HMA/EMA Strategy with Staged Exits
 ===================================================================
 
 Strategy:
-  - Indicators: UT Bot (ATR 10, K=2.5), HMA(100), EMA(200) via pandas-ta
+  - Indicators: UT Bot (ATR 10, K=2.5), HMA(100), EMA(200), ADX(14)
   - Entry:  UT Bot Buy ENV (≥2 days)  AND  Close > HMA(100)  AND  Close > EMA(200)
             AND  ADX(14) > 20  AND  Volume > 20d SMA
             → execute at NEXT day's open price
-            Position size = 5% of current equity (compounding, max 20 concurrent)
-            Cooldown: 3 days after stop-out before re-entering same symbol
-            Max 2 entries per buy-environment episode (same symbol)
-  - Exit:   TP at 5×ATR from entry (adaptive per symbol)
-            Breakeven stop: once profit ≥ 2.5×ATR, stop moves to entry price
+            Position size = 5% of current equity (×0.75 when SPY < EMA200)
+            Cooldown: 3 days after stop-out; max 3 entries per buy-env episode
+  - Exit:   TP at 4×ATR from entry (adaptive)
+            保利止损: profit ≥ 2×ATR → stop at 1×ATR profit (locks profit)
   - Stop-loss: Close < HMA(100)  OR  Close < EMA(200)  OR  UT Bot Sell env
+  - Market regime: SPY < EMA(200) → reduce allocation 25%
 
 Usage:
     uv run backtest.py
@@ -50,14 +50,20 @@ EMA_LENGTH = 200
 # ATR-adaptive profit-taking & breakeven stop
 # TP target  = entry_price × (1 + TP_ATR_MULT × ATR / entry_price)
 # BE trigger = entry_price × (1 + BE_ATR_MULT × ATR / entry_price)
-TP_ATR_MULT = 4.0                   # take profit at 5× ATR from entry
-BE_ATR_MULT = 2.0                   # activate breakeven stop at 2.5× ATR (half of TP)
-BE_STOP_PCT = 0.0                   # breakeven stop at entry price (0 % profit)
+TP_ATR_MULT = 4.0                   # take profit at 4× ATR from entry
+BE_ATR_MULT = 2.0                   # activate breakeven stop at 2× ATR
+BE_STOP_ATR_MULT = 1.0              # once BE active, stop at 1× ATR profit (保利止损)
 
 # Entry filters
 COOLDOWN_DAYS = 3                   # days to wait after stop-out before re-entering same symbol
 BUY_ENV_MIN_DAYS = 2                # buy environment must persist ≥ N days before entry
 MAX_ENTRIES_PER_ENV = 3             # max entries per buy-environment episode (same symbol)
+TIME_STOP_DAYS = 999                # disabled (built-in HMA/EMA stops are sufficient)
+TIME_STOP_LOSS_FLOOR = -0.05        # (unused)
+RSI_OB_THRESHOLD = 100              # disabled (counterproductive for momentum)
+
+# Portfolio position sizing
+BEAR_POSITION_MULT = 0.75           # reduce allocation 25% when SPY < EMA(200)
 
 REPORTS_DIR = Path("reports")       # per-symbol reports
 
@@ -176,11 +182,15 @@ def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
         df["ut_buy_signal"] = buy_signal
         df["atr"] = atr_series
 
-        # ADX(14)
+        # ADX(14) + slope
         adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
         df["adx"] = adx_df[f"ADX_14"]
+        df["adx_rising"] = df["adx"] > df["adx"].shift(1)
 
-        df = df.dropna(subset=["hma", "ema200", "adx"])
+        # RSI(14) — overbought filter
+        df["rsi"] = ta.rsi(df["close"], length=14)
+
+        df = df.dropna(subset=["hma", "ema200", "adx", "rsi"])
         if len(df) < 50:
             continue
 
@@ -231,7 +241,7 @@ class Position:
         "symbol", "entry_price", "entry_date",
         "initial_shares", "remaining_shares",
         "breakeven_active",
-        "tp_pct", "be_trigger_pct",
+        "tp_pct", "be_trigger_pct", "be_stop_pct",
     )
 
     def __init__(self, symbol, entry_price, entry_date, shares, entry_atr: float = 0.0):
@@ -243,14 +253,16 @@ class Position:
         self.breakeven_active = False
         # ATR-adaptive thresholds (computed once at entry)
         atr_pct = entry_atr / entry_price if entry_price > 0 else 0.05
-        self.tp_pct = TP_ATR_MULT * atr_pct          # e.g. 5 × 3% = 15%
-        self.be_trigger_pct = BE_ATR_MULT * atr_pct   # e.g. 2.5 × 3% = 7.5%
+        self.tp_pct = TP_ATR_MULT * atr_pct
+        self.be_trigger_pct = BE_ATR_MULT * atr_pct
+        self.be_stop_pct = BE_STOP_ATR_MULT * atr_pct  # profit floor once BE active
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Simulation Engine
 # ═══════════════════════════════════════════════════════════════════════════════
-def run_backtest(all_data: dict[str, pd.DataFrame]):
+def run_backtest(all_data: dict[str, pd.DataFrame],
+                 spy_regime: pd.Series | None = None):
     """
     Run the event-driven portfolio simulation.
 
@@ -283,8 +295,7 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
         closed_today: set[str] = set()
 
         # ── Phase 0: Execute pending entries at today's OPEN ──────────────
-        # Compounding: compute current equity at today's open and size each
-        # position as POSITION_PCT of that equity.
+        # Vol-inverse sizing: each position sized by RISK_PER_TRADE / ATR%
         if pending_entries:
             pos_value_open = sum(
                 pos.remaining_shares * (
@@ -295,7 +306,11 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
                 for s, pos in positions.items()
             )
             current_equity = cash + pos_value_open
-            alloc_amount = current_equity * POSITION_PCT
+            # Bear market multiplier
+            is_bull = True
+            if spy_regime is not None and len(spy_regime) > 0:
+                is_bull = spy_regime.get(date, True)
+            regime_mult = 1.0 if is_bull else BEAR_POSITION_MULT
 
         for sym in sorted(pending_entries):
             if sym in positions:
@@ -307,7 +322,11 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
             if open_price <= 0 or np.isnan(open_price):
                 continue
 
-            budget = min(alloc_amount, cash)
+            # Flat 5% allocation × bear-market adjustment
+            entry_atr = df.loc[date, "atr"] if not np.isnan(df.loc[date, "atr"]) else 0.0
+            alloc = current_equity * POSITION_PCT * regime_mult
+
+            budget = min(alloc, cash)
             if budget < 100:
                 continue
             shares = int(budget / open_price)
@@ -316,7 +335,6 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
 
             cost = shares * open_price
             cash -= cost
-            entry_atr = df.loc[date, "atr"] if not np.isnan(df.loc[date, "atr"]) else 0.0
             positions[sym] = Position(sym, open_price, date, shares, entry_atr)
             trade_log.append(dict(
                 symbol=sym, date=date, side="BUY",
@@ -345,8 +363,8 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
             if not pos.breakeven_active and pnl_pct >= pos.be_trigger_pct:
                 pos.breakeven_active = True
 
-            # ─ Breakeven stop: once activated, if price drops back to entry → exit
-            if pos.breakeven_active and pnl_pct <= BE_STOP_PCT:
+            # ─ 保利止损: once activated, if profit drops to 1×ATR floor → exit
+            if pos.breakeven_active and pnl_pct <= pos.be_stop_pct:
                 sell_n = pos.remaining_shares
                 if sell_n > 0:
                     cash += sell_n * price
@@ -354,6 +372,24 @@ def run_backtest(all_data: dict[str, pd.DataFrame]):
                         symbol=sym, date=date, side="SELL",
                         shares=sell_n, price=price,
                         reason="BE_STOP", pnl_pct=pnl_pct,
+                        entry_price=pos.entry_price, entry_date=pos.entry_date,
+                    ))
+                    pos.remaining_shares = 0
+                to_remove.append(sym)
+                closed_today.add(sym)
+                cooldown_until[sym] = date + pd.Timedelta(days=COOLDOWN_DAYS)
+                continue
+
+            # ─ Time stop: force-exit if holding ≥ N days and PnL below floor
+            hold_days = (date - pos.entry_date).days
+            if hold_days >= TIME_STOP_DAYS and pnl_pct < TIME_STOP_LOSS_FLOOR:
+                sell_n = pos.remaining_shares
+                if sell_n > 0:
+                    cash += sell_n * price
+                    trade_log.append(dict(
+                        symbol=sym, date=date, side="SELL",
+                        shares=sell_n, price=price,
+                        reason="TIME_STOP", pnl_pct=pnl_pct,
                         entry_price=pos.entry_price, entry_date=pos.entry_date,
                     ))
                     pos.remaining_shares = 0
@@ -486,6 +522,24 @@ def build_round_trips(trade_df: pd.DataFrame) -> list[dict]:
                 ))
             i = j
     return trips
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPY Market Regime (bear filter)
+# ═══════════════════════════════════════════════════════════════════════════════
+def load_spy_regime() -> pd.Series:
+    """Return a bool Series indexed by date: True = bull (SPY ≥ EMA200)."""
+    spy_path = DATA_DIR / "SPY_25Y_daily.csv"
+    if not spy_path.exists():
+        print("[regime] SPY data not found — regime filter disabled")
+        return pd.Series(dtype=bool)
+    df = pd.read_csv(spy_path, parse_dates=["date"], index_col="date").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    df["spy_ema200"] = ta.ema(df["close"], length=200)
+    regime = (df["close"] >= df["spy_ema200"]).dropna()
+    print(f"[regime] SPY EMA(200) regime: "
+          f"{regime.sum()}/{len(regime)} bull days ({regime.mean()*100:.0f}%)")
+    return regime
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -690,14 +744,28 @@ def run_single_backtest(df: pd.DataFrame, symbol: str,
             if not pos.breakeven_active and pnl_pct >= pos.be_trigger_pct:
                 pos.breakeven_active = True
 
-            # Breakeven stop
-            if pos.breakeven_active and pnl_pct <= BE_STOP_PCT:
+            # 保利止损: profit drops to 1×ATR floor
+            if pos.breakeven_active and pnl_pct <= pos.be_stop_pct:
                 sell_n = pos.remaining_shares
                 cash += sell_n * close_price
                 trade_log.append(dict(
                     symbol=symbol, date=date, side="SELL",
                     shares=sell_n, price=close_price,
                     reason="BE_STOP", pnl_pct=pnl_pct,
+                    entry_price=pos.entry_price, entry_date=pos.entry_date,
+                ))
+                pos.remaining_shares = 0
+                closed = True
+                cooldown_end = date + pd.Timedelta(days=COOLDOWN_DAYS)
+
+            # Time stop: holding ≥ N days and PnL below floor
+            elif (date - pos.entry_date).days >= TIME_STOP_DAYS and pnl_pct < TIME_STOP_LOSS_FLOOR:
+                sell_n = pos.remaining_shares
+                cash += sell_n * close_price
+                trade_log.append(dict(
+                    symbol=symbol, date=date, side="SELL",
+                    shares=sell_n, price=close_price,
+                    reason="TIME_STOP", pnl_pct=pnl_pct,
                     entry_price=pos.entry_price, entry_date=pos.entry_date,
                 ))
                 pos.remaining_shares = 0
@@ -953,7 +1021,7 @@ def _chart_exit_reasons(round_trips: list[dict]) -> str:
     raw = [t["exit_reason"] for t in round_trips]
     consolidated = [r if not r.startswith("TP_") else "TP" for r in raw]
     reasons = pd.Series(consolidated).value_counts()
-    colors = {"STOP": "#ef5350", "TP": "#26a69a", "BE_STOP": "#ff9800"}
+    colors = {"STOP": "#ef5350", "TP": "#26a69a", "BE_STOP": "#ff9800", "TIME_STOP": "#9c27b0"}
     marker_colors = [colors.get(r, "#9e9e9e") for r in reasons.index]
     fig = go.Figure(go.Pie(
         labels=reasons.index, values=reasons.values,
@@ -1343,9 +1411,10 @@ HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
 <h3>Strategy Rules</h3>
 <ul>
   <li><b>Indicators:</b> UT Bot (ATR {{ atr_period }}, K={{ ut_k }}), HMA({{ hma_len }}), EMA({{ ema_len }})</li>
-  <li><b>Entry:</b> UT Bot <em>Buy environment (&ge;2 days)</em> AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) AND ADX(14) &gt; 20 AND Volume &gt; 20d SMA &rarr; buy at <b>next day's open</b> &mdash; allocate {{ pos_pct }}% of <b>current equity</b> per position (compounding, max 20 concurrent). <b>Cooldown:</b> 3 days after stop-out. <b>Max 2 entries</b> per buy-environment episode.</li>
-  <li><b>Take profit:</b> ATR-adaptive &mdash; sell all at <b>5&times;ATR</b> from entry (varies per symbol &amp; trade). <b>Breakeven stop:</b> once profit &ge; <b>2.5&times;ATR</b>, stop-loss moves to entry price (保本止损).</li>
+  <li><b>Entry:</b> UT Bot <em>Buy environment (&ge;2 days)</em> AND Close &gt; HMA({{ hma_len }}) AND Close &gt; EMA({{ ema_len }}) AND ADX(14) &gt; 20 AND Volume &gt; 20d SMA &rarr; buy at <b>next day's open</b>. <b>Sizing:</b> 5% of current equity (&times;0.75 in bear market). <b>Cooldown:</b> 3 days after stop-out. <b>Max 3 entries</b> per buy-environment episode.</li>
+  <li><b>Take profit:</b> ATR-adaptive &mdash; sell all at <b>4&times;ATR</b> from entry. <b>保利止损:</b> once profit &ge; <b>2&times;ATR</b>, stop moves to <b>1&times;ATR</b> profit floor (locks gains).</li>
   <li><b>Stop-loss:</b> Close &lt; HMA({{ hma_len }}) OR Close &lt; EMA({{ ema_len }}) OR UT Bot enters <em>Sell</em> environment</li>
+  <li><b>Market regime:</b> SPY &lt; EMA(200) &rarr; reduce allocation 25%</li>
 </ul>
 <p style="margin-top:8px;color:var(--muted);">Data: {{ n_symbols }} symbols, {{ start_date }} &rarr; {{ end_date }} ({{ total_years|round(1) }} years). Initial capital ${{ "{:,.0f}".format(initial_capital) }}.</p>
 </div>
@@ -1546,6 +1615,9 @@ def main():
     # 1. Load data & indicators (stocks only, ETFs excluded)
     all_data = load_all_data(exclude_etfs=True)
 
+    # 1b. Load SPY market regime for bear-market filter
+    spy_regime = load_spy_regime()
+
     # ══════════════════════════════════════════════════════════
     # A) Per-Symbol Full-Position Backtests
     # ══════════════════════════════════════════════════════════
@@ -1571,11 +1643,11 @@ def main():
     # B) Portfolio Backtest (5 % allocation per symbol)
     # ══════════════════════════════════════════════════════════
     print(f"\n{'─'*60}")
-    print(f"  Portfolio backtest (5% allocation, stocks only)")
+    print(f"  Portfolio backtest (vol-inverse sizing, stocks only)")
     print(f"{'─'*60}")
 
-    # 2. Run portfolio simulation
-    equity_df, trade_df = run_backtest(all_data)
+    # 2. Run portfolio simulation (with bear-market filter)
+    equity_df, trade_df = run_backtest(all_data, spy_regime=spy_regime)
 
     # 3. Build round-trip trades
     round_trips = build_round_trips(trade_df)
