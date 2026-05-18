@@ -65,6 +65,17 @@ RSI_OB_THRESHOLD = 100              # disabled (counterproductive for momentum)
 # Portfolio position sizing
 BEAR_POSITION_MULT = 0.75           # reduce allocation 25% when SPY < EMA(200)
 
+# ── Smart Money Flow (SMF) factor ─────────────────────────────────────────────
+# Rebuilt from ITALS concept with cleaner building blocks:
+#   1. OBV slope  — sign(close-open) weighted volume delta over N days
+#   2. Spread-normalised volume — volume / intraday-range, detects quiet accumulation
+#   3. VWAP deviation — (close - vwap) / close, positive = closing above average price
+# Composite = rolling z-score of (obv_slope + spread_norm_vol + vwap_dev)
+SMF_WINDOW   = 20         # rolling window (trading days)
+SMF_ZSCORE_W = 60         # z-score normalization window
+SMF_ENTRY_THRESHOLD = 0.0 # factor must be > 0 to confirm entry (smart money net inflow)
+SMF_SIZE_BOOST = 0.5     # max extra allocation when factor is strong (e.g. 0.25 → up to +25%)
+
 REPORTS_DIR = Path("reports")       # per-symbol reports
 
 # ETFs to exclude (only keep individual stocks for trading)
@@ -73,7 +84,7 @@ ETF_SYMBOLS = {
     "GLD", "HYG", "IBIT", "IGV", "IWM", "KWEB",
     "PRF", "PRFZ", "QQQ", "SCHG", "SCHI", "SLV",
     "SMH", "SOXL", "SOXX", "SPY", "SQQQ", "TLT",
-    "TQQQ", "TSLL",
+    "TQQQ", "TSLL", "MUU",
 }
 
 # Blacklisted Symbols
@@ -147,6 +158,69 @@ def calc_ut_bot(close: pd.Series, high: pd.Series, low: pd.Series,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Smart Money Flow (SMF) Factor
+# ═══════════════════════════════════════════════════════════════════════════════
+def calc_smart_money_flow(df: pd.DataFrame,
+                          window: int = SMF_WINDOW,
+                          zscore_w: int = SMF_ZSCORE_W) -> pd.Series:
+    """
+    Composite volume-price factor (rebuilt from ITALS concept).
+
+    Building blocks
+    ---------------
+    1. OBV slope:  rolling regression slope of cumulative
+       sign(close-open)-weighted volume → detects sustained directional flow.
+    2. Spread-normalised volume:  volume / ((high-low)/close) → high value
+       means large volume on small range → quiet accumulation / distribution.
+    3. VWAP deviation:  (close - vwap) / close → positive = close above
+       average transaction price → buyer dominance.
+
+    Output
+    ------
+    Rolling z-score of the composite.  Positive = smart money inflow.
+    """
+    c, o, h, l, v = df["close"], df["open"], df["high"], df["low"], df["volume"]
+
+    # ── 1. OBV slope ─────────────────────────────────────────────────────
+    direction = np.sign(c - o)                          # +1 / 0 / -1
+    directed_vol = direction * v
+    obv = directed_vol.cumsum()
+    # Linear regression slope over window (using rolling cov / var shortcut)
+    x = pd.Series(np.arange(len(obv)), index=obv.index, dtype=float)
+    obv_slope = obv.rolling(window).cov(x) / (x.rolling(window).var() + 1e-10)
+    # Normalise to z-score within its own history
+    obv_z = (obv_slope - obv_slope.rolling(zscore_w).mean()) / (
+        obv_slope.rolling(zscore_w).std() + 1e-10)
+
+    # ── 2. Spread-normalised volume ──────────────────────────────────────
+    spread = (h - l) / (c + 1e-10)
+    spread_norm = v / (spread + 1e-10)
+    sn_ma = spread_norm.rolling(window).mean()
+    sn_z = (sn_ma - sn_ma.rolling(zscore_w).mean()) / (
+        sn_ma.rolling(zscore_w).std() + 1e-10)
+
+    # ── 3. VWAP deviation ────────────────────────────────────────────────
+    vwap = df.get("vwap")
+    if vwap is None or vwap.isna().all():
+        # Approximate VWAP from OHLC: typical price
+        vwap = (h + l + c) / 3
+    vwap_dev = (c - vwap) / (c + 1e-10)
+    vd_ma = vwap_dev.rolling(window).mean()
+    vd_z = (vd_ma - vd_ma.rolling(zscore_w).mean()) / (
+        vd_ma.rolling(zscore_w).std() + 1e-10)
+
+    # ── Composite ────────────────────────────────────────────────────────
+    raw = obv_z + sn_z + vd_z          # equal weight
+
+    # Final z-score (clip extremes)
+    smf = (raw - raw.rolling(zscore_w).mean()) / (
+        raw.rolling(zscore_w).std() + 1e-10)
+    smf = smf.clip(-4, 4)
+
+    return smf
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Data Loading & Indicator Computation
 # ═══════════════════════════════════════════════════════════════════════════════
 def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
@@ -209,9 +283,13 @@ def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
         df["vol_sma20"] = df["volume"].rolling(20).mean()
         df["vol_above_avg"] = df["volume"] > df["vol_sma20"]
 
+        # Smart Money Flow factor
+        df["smf"] = calc_smart_money_flow(df)
+
         # Pre-computed signals
         # Entry: UT Bot buy env ≥ N days + close > HMA + close > EMA
         #        + ADX > 20 + volume above 20d avg
+        #        + SMF > threshold (smart money confirmation)
         # (actual buy happens at NEXT day's open)
         df["entry_ok"] = (
             df["ut_buy"]
@@ -220,6 +298,7 @@ def load_all_data(exclude_etfs: bool = True) -> dict[str, pd.DataFrame]:
             & (df["close"] > df["ema200"])
             & (df["adx"] > 20)
             & df["vol_above_avg"]
+            & (df["smf"] > SMF_ENTRY_THRESHOLD)
         )
         df["stop_hit"] = (
             (df["close"] < df["hma"])
@@ -322,9 +401,12 @@ def run_backtest(all_data: dict[str, pd.DataFrame],
             if open_price <= 0 or np.isnan(open_price):
                 continue
 
-            # Flat 5% allocation × bear-market adjustment
+            # 5% allocation × bear-market adjustment × SMF factor boost
             entry_atr = df.loc[date, "atr"] if not np.isnan(df.loc[date, "atr"]) else 0.0
-            alloc = current_equity * POSITION_PCT * regime_mult
+            # SMF-based sizing: boost allocation up to +25% when factor is strong
+            smf_val = df.loc[date, "smf"] if "smf" in df.columns and not np.isnan(df.loc[date, "smf"]) else 0.0
+            smf_boost = 1.0 + SMF_SIZE_BOOST * max(0.0, min(smf_val / 2.0, 1.0))  # linear 0→+25% over smf 0→2
+            alloc = current_equity * POSITION_PCT * regime_mult * smf_boost
 
             budget = min(alloc, cash)
             if budget < 100:
